@@ -79,8 +79,10 @@ def _fake_qwen_full_attention(*, q_heads: int = 4, kv_heads: int = 1, head_dim: 
         def __call__(self, x: mx.array) -> mx.array:
             return x
 
-    class _Cache:
-        offset = 4096
+    class _Cache(qwen_gdn.DFlashTargetKVCache):
+        def __init__(self) -> None:
+            super().__init__()
+            self.offset = 4096
 
         def update_and_fetch(self, keys: mx.array, values: mx.array):
             return keys, values

@@ -35,6 +35,14 @@ _TREE_PREFIX_LEN_ATTR = "_dflash_tree_prefix_len"
 _TREE_SIZE_ATTR = "_dflash_tree_size"
 
 
+class DFlashTargetKVCache(cache_mod.KVCache):
+    """Full-attention KV cache owned by a DFlash target runtime."""
+
+
+class DFlashTargetRotatingKVCache(cache_mod.RotatingKVCache):
+    """Rotating KV cache owned by a DFlash target runtime."""
+
+
 def _int_attr(obj: Any, name: str) -> int:
     value = getattr(obj, name, 0)
     if value is None:
@@ -671,6 +679,11 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        if not isinstance(
+            cache,
+            (DFlashTargetKVCache, DFlashTargetRotatingKVCache),
+        ):
+            return original_call(self, x, mask=mask, cache=cache)
         tree_output = _tree_attention_call(self, x, mask=mask, cache=cache)
         if tree_output is not None:
             return tree_output
@@ -1000,11 +1013,11 @@ class QwenGdnTargetOps:
                     caches.append(cache_mod.ArraysCache(size=2))
             else:
                 if fa_window > 0:
-                    caches.append(cache_mod.RotatingKVCache(max_size=fa_window))
+                    caches.append(DFlashTargetRotatingKVCache(max_size=fa_window))
                 elif quantize_kv_cache:
                     caches.append(cache_mod.QuantizedKVCache(group_size=64, bits=8))
                 else:
-                    caches.append(cache_mod.KVCache())
+                    caches.append(DFlashTargetKVCache())
         return caches
 
     def arm_rollback(self, cache_entries: list[Any], *, prefix_len: int) -> None:
