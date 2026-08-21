@@ -699,6 +699,8 @@ class SpeculativeSession:
                 enable_speculative_linear_cache=True,
                 quantize_kv_cache=quantize_kv_cache,
                 target_fa_window=target_fa_window,
+                cache_capacity_tokens=len(prompt_tokens)
+                + max(0, int(max_new_tokens)),
             )
             try:
                 assert prefix_snapshot is not None
@@ -715,6 +717,8 @@ class SpeculativeSession:
                 enable_speculative_linear_cache=True,
                 quantize_kv_cache=quantize_kv_cache,
                 target_fa_window=target_fa_window,
+                cache_capacity_tokens=len(prompt_tokens)
+                + max(0, int(max_new_tokens)),
             )
         draft_cache = draft_backend.make_cache(
             draft_model=draft_model,
@@ -816,9 +820,23 @@ class SpeculativeSession:
         stable_prefix_len = request.stable_prefix_len
         prefix_cache_active = request.prefix_cache_active
 
-        feature_store = TargetFeatureStore(
-            prompt_len=prompt_len,
-            project_context=draft_model.project_target_hidden,
+        feature_store_factory = getattr(
+            self.draft_backend,
+            "make_target_feature_store",
+            None,
+        )
+        feature_store = (
+            TargetFeatureStore(
+                prompt_len=prompt_len,
+                project_context=draft_model.project_target_hidden,
+            )
+            if feature_store_factory is None
+            else feature_store_factory(
+                prompt_len=prompt_len,
+                project_context=draft_model.project_target_hidden,
+                draft_model=draft_model,
+                draft_cache=self.draft_cache,
+            )
         )
         if supports_prefix_snapshot and snapshot_service is None:
             if prefix_cache_active:

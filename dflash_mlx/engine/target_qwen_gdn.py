@@ -992,7 +992,9 @@ class QwenGdnTargetOps:
         enable_speculative_linear_cache: bool,
         quantize_kv_cache: bool = False,
         target_fa_window: Optional[int] = None,
+        cache_capacity_tokens: Optional[int] = None,
     ) -> list[Any]:
+        del cache_capacity_tokens
         fa_window = 0 if target_fa_window is None else int(target_fa_window)
         if fa_window < 0:
             raise ValueError("target_fa_window must be >= 0")

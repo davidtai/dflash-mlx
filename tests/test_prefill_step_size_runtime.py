@@ -39,6 +39,7 @@ class _FakeTargetOps:
         self.cleanup_calls = 0
         self.restore_delay_s = float(restore_delay_s)
         self.restore_ns = int(restore_ns)
+        self.cache_capacity_tokens: list[int | None] = []
 
     def capabilities_for(self, _target_model):
         return SimpleNamespace(supports_prefix_snapshot=True, supports_tree_verify=False)
@@ -47,6 +48,7 @@ class _FakeTargetOps:
         return True
 
     def make_cache(self, *_args, **_kwargs):
+        self.cache_capacity_tokens.append(_kwargs.get("cache_capacity_tokens"))
         return []
 
     def forward_with_hidden_capture(
@@ -551,6 +553,7 @@ def test_runtime_prefill_chunks_use_configured_step_size():
     )
 
     assert target_ops.forward_lengths == [4, 4, 1, 1]
+    assert target_ops.cache_capacity_tokens == [10]
     assert target_ops.logits_last_only_flags == [True, True, True, True]
     assert [
         event.tokens_processed

@@ -17,6 +17,16 @@ from dflash_mlx.model import (
 
 
 class DraftBackend(Protocol):
+    def make_target_feature_store(
+        self,
+        *,
+        prompt_len: int,
+        project_context: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+    ) -> Any:
+        ...
+
     def make_cache(
         self,
         *,
@@ -120,6 +130,22 @@ class DraftBackend(Protocol):
 
 
 class EagerDraftBackend:
+    def make_target_feature_store(
+        self,
+        *,
+        prompt_len: int,
+        project_context: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+    ) -> Any:
+        del draft_model, draft_cache
+        from dflash_mlx.engine.target_features import TargetFeatureStore
+
+        return TargetFeatureStore(
+            prompt_len=int(prompt_len),
+            project_context=project_context,
+        )
+
     def make_cache(
         self,
         *,

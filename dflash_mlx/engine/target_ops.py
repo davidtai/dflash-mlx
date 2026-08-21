@@ -50,6 +50,7 @@ class TargetOps(Protocol):
         enable_speculative_linear_cache: bool,
         quantize_kv_cache: bool = False,
         target_fa_window: Optional[int] = None,
+        cache_capacity_tokens: Optional[int] = None,
     ) -> list[Any]: ...
 
     def install_speculative_hooks(self, target_model: Any) -> None: ...

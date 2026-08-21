@@ -126,3 +126,56 @@ class TargetFeatureStore:
         projected = self.project_context(features)
         mx.eval(projected)
         return projected
+
+
+@dataclass
+class StreamingTargetFeatureStore(TargetFeatureStore):
+    """Consume projected prompt chunks immediately and retain no prompt tensor."""
+
+    consume_prompt_chunk: Callable[..., None] | None = None
+
+    def hydrate_from_snapshot(self, prefix_snapshot: Any, *, snap_prefix_len: int):
+        del prefix_snapshot, snap_prefix_len
+        raise RuntimeError("streaming target features do not support prefix snapshots")
+
+    def write_prompt_slice(
+        self,
+        *,
+        start: int,
+        end: int,
+        features: mx.array,
+    ) -> mx.array:
+        start = int(start)
+        end = int(end)
+        if end <= start or int(features.shape[1]) != end - start:
+            raise ValueError("streamed target feature span does not match its rows")
+        if self.consume_prompt_chunk is None:
+            raise RuntimeError("streaming target feature consumer is not installed")
+        projected = self._project(features)
+        self.consume_prompt_chunk(start=start, end=end, features=projected)
+        self._current_hidden = mx.zeros(
+            (int(projected.shape[0]), 0, int(projected.shape[-1])),
+            dtype=projected.dtype,
+        )
+        return self._current_hidden
+
+    def prefix_view(self, boundary: int) -> None:
+        del boundary
+        return None
+
+    def freeze_prefill_for_snapshot(self, *, enabled: bool) -> None:
+        if enabled:
+            raise RuntimeError("streaming target features cannot publish snapshots")
+
+    def commit_generation(
+        self,
+        committed_hidden: mx.array,
+        *,
+        collect_snapshot: bool,
+    ) -> None:
+        if collect_snapshot:
+            raise RuntimeError("streaming target features cannot collect snapshots")
+        self._current_hidden = self._project(committed_hidden)
+
+    def generation_snapshot_hidden(self) -> None:
+        return None

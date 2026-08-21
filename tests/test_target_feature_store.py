@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from dflash_mlx.engine.target_features import TargetFeatureStore
+from dflash_mlx.engine.target_features import (
+    StreamingTargetFeatureStore,
+    TargetFeatureStore,
+)
 
 
 def _snapshot(hidden):
@@ -107,3 +110,43 @@ def test_target_feature_store_generation_snapshot_is_none_when_not_collected():
 
     assert store.generation_snapshot_hidden() is None
     assert store.generation_chunks == ()
+
+
+def test_streaming_target_feature_store_consumes_prompt_chunks_without_retaining_prompt():
+    consumed = []
+
+    def project(features):
+        return features[..., :2] * 3
+
+    def consume(*, start, end, features):
+        consumed.append((start, end, features))
+
+    store = StreamingTargetFeatureStore(
+        prompt_len=6,
+        project_context=project,
+        consume_prompt_chunk=consume,
+    )
+    store.write_prompt_slice(
+        start=0,
+        end=4,
+        features=mx.ones((1, 4, 5), dtype=mx.bfloat16),
+    )
+    current = store.write_prompt_slice(
+        start=4,
+        end=6,
+        features=mx.ones((1, 2, 5), dtype=mx.bfloat16) * 2,
+    )
+
+    assert [(start, end) for start, end, _features in consumed] == [(0, 4), (4, 6)]
+    assert [tuple(features.shape) for _start, _end, features in consumed] == [
+        (1, 4, 2),
+        (1, 2, 2),
+    ]
+    assert tuple(current.shape) == (1, 0, 2)
+    assert tuple(store.require_current_hidden().shape) == (1, 0, 2)
+
+    store.commit_generation(
+        mx.ones((1, 1, 5), dtype=mx.bfloat16),
+        collect_snapshot=False,
+    )
+    assert tuple(store.require_current_hidden().shape) == (1, 1, 2)

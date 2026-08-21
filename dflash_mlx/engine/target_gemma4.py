@@ -396,7 +396,9 @@ class Gemma4TargetOps:
         enable_speculative_linear_cache: bool,
         quantize_kv_cache: bool = False,
         target_fa_window: Optional[int] = None,
+        cache_capacity_tokens: Optional[int] = None,
     ) -> list[Any]:
+        del cache_capacity_tokens
         if quantize_kv_cache:
             raise ValueError("Gemma4 target KV quantization is not supported yet")
         if target_fa_window is not None and int(target_fa_window) > 0:
