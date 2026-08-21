@@ -639,6 +639,7 @@ class SpeculativeSession:
     quantize_kv_cache: bool
     snap_prefix_len: int
     supports_prefix_snapshot: bool
+    supports_chunked_prefill: bool
     allow_full_context_draft_layers: bool
     draft_sink_size: int
     draft_window_size: int
@@ -661,6 +662,7 @@ class SpeculativeSession:
         draft_backend: DraftBackend,
         target_ops: Any,
         supports_prefix_snapshot: bool,
+        supports_chunked_prefill: bool,
         allow_full_context_draft_layers: bool,
         prompt_tokens: Sequence[int],
         max_new_tokens: int,
@@ -739,6 +741,7 @@ class SpeculativeSession:
             quantize_kv_cache=bool(quantize_kv_cache),
             snap_prefix_len=snap_prefix_len,
             supports_prefix_snapshot=supports_prefix_snapshot,
+            supports_chunked_prefill=supports_chunked_prefill,
             allow_full_context_draft_layers=allow_full_context_draft_layers,
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
@@ -799,6 +802,7 @@ class SpeculativeSession:
         runtime_config = self.runtime_config
         snap_prefix_len = self.snap_prefix_len
         supports_prefix_snapshot = self.supports_prefix_snapshot
+        supports_chunked_prefill = self.supports_chunked_prefill
         allow_full_context_draft_layers = self.allow_full_context_draft_layers
         target_layer_id_list = self.target_layer_id_list
         capture_layer_ids = self.capture_layer_ids
@@ -868,7 +872,7 @@ class SpeculativeSession:
         snapshot_boundary = (
             compute_snapshot_boundary(prompt_len, stable_prefix_len)
             if supports_prefix_snapshot
-            else 0
+            else prompt_len if supports_chunked_prefill else 0
         )
         prefill_context_len = max(0, snapshot_boundary - 1)
         chunked_start = min(snap_prefix_len, prefill_context_len)
@@ -2848,6 +2852,13 @@ def stream_dflash_generate_impl(
     supports_prefix_snapshot = bool(
         getattr(target_capabilities, "supports_prefix_snapshot", True)
     )
+    supports_chunked_prefill = bool(
+        getattr(
+            target_capabilities,
+            "supports_chunked_prefill",
+            supports_prefix_snapshot,
+        )
+    )
     prompt_tokens = (
         list(prompt_tokens_override)
         if prompt_tokens_override is not None
@@ -2912,6 +2923,7 @@ def stream_dflash_generate_impl(
         draft_backend=draft_backend,
         target_ops=target_ops,
         supports_prefix_snapshot=supports_prefix_snapshot,
+        supports_chunked_prefill=supports_chunked_prefill,
         allow_full_context_draft_layers=allow_full_context_draft_layers,
         prompt_tokens=request.prompt_tokens,
         max_new_tokens=max_new_tokens,

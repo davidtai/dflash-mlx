@@ -565,6 +565,46 @@ def test_runtime_prefill_chunks_use_configured_step_size():
     assert isinstance(events[-1], SummaryEvent)
 
 
+def test_runtime_prefill_chunks_without_prefix_snapshot_serialization():
+    class _ChunkOnlyTargetOps(_FakeTargetOps):
+        def capabilities_for(self, _target_model):
+            return SimpleNamespace(
+                supports_chunked_prefill=True,
+                supports_prefix_snapshot=False,
+                supports_tree_verify=False,
+            )
+
+    target_ops = _ChunkOnlyTargetOps()
+    context = build_runtime_context(
+        runtime_config_from_defaults(
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(10)),
+            runtime_context=context,
+        )
+    )
+
+    assert target_ops.forward_lengths == [4, 4, 1, 1]
+    prefill_event = next(
+        event for event in events if isinstance(event, PrefillCompleteEvent)
+    )
+    assert prefill_event.snapshot_boundary == 10
+    assert prefill_event.prefill_tokens_computed == 10
+
+
 def test_clear_cache_boundaries_false_skips_mlx_clear_cache(monkeypatch):
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()

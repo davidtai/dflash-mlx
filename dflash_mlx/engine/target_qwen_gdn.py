@@ -817,6 +817,7 @@ class QwenGdnTargetOps:
             supports_verify_linear=self._supports_verify_linear(target_model),
             supports_tree_verify=True,
             supports_full_context_draft_layers=True,
+            supports_chunked_prefill=True,
         )
 
     def supports_tree_cache(self, cache_entries: list[Any]) -> bool:

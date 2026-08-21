@@ -22,6 +22,7 @@ class TargetCapabilities:
     supports_verify_linear: bool = False
     supports_full_context_draft_layers: bool = False
     supports_tree_verify: bool = False
+    supports_chunked_prefill: bool = False
 
 class TargetOps(Protocol):
     backend_name: str
