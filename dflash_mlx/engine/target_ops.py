@@ -75,6 +75,12 @@ class TargetOps(Protocol):
         captured: list[mx.array] | dict[int, mx.array],
     ) -> None: ...
 
+    def schedule_verify_chunk(
+        self,
+        cache_entries: list[Any],
+        posterior: mx.array,
+    ) -> None: ...
+
     def verify_block(
         self,
         *,

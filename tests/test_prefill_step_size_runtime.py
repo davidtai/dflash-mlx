@@ -172,6 +172,7 @@ class _FixedLinearTargetOps(_FakeTargetOps):
         self.restore_calls = 0
         self.restore_arguments: list[tuple[int, int, int]] = []
         self.prefill_settlement_lengths: list[int] = []
+        self.verify_settlement_lengths: list[int] = []
 
     def capabilities_for(self, _target_model):
         return SimpleNamespace(
@@ -189,6 +190,11 @@ class _FixedLinearTargetOps(_FakeTargetOps):
             mx.eval(logits, *captured.values())
         else:
             mx.eval(logits, *captured)
+
+    def schedule_verify_chunk(self, cache_entries, posterior):
+        del cache_entries
+        self.verify_settlement_lengths.append(int(posterior.shape[0]))
+        mx.async_eval(posterior)
 
     def verify_block(self, **kwargs):
         self.verify_calls += 1
@@ -2712,6 +2718,7 @@ def test_fixed_linear_single_prefill_token_skips_terminal_verify():
     assert target_ops.verify_calls == 0
     assert target_ops.restore_calls == 0
     assert target_ops.prefill_settlement_lengths == [1, 1]
+    assert target_ops.verify_settlement_lengths == []
     assert draft_backend.calls == []
 
 
@@ -2759,6 +2766,7 @@ def test_fixed_linear_capability_keeps_physical_width_at_output_tail():
     summary = next(event for event in events if isinstance(event, SummaryEvent))
 
     assert target_ops.verify_lengths == [4, 4]
+    assert target_ops.verify_settlement_lengths == [4, 4]
     assert target_ops.restore_arguments == [(6, 3, 3), (8, 1, 3)]
     assert draft_backend.calls == [(4, True), (4, True)]
     assert summary.generated_token_ids == (0, 0, 0, 0, 0, 0)
@@ -2798,6 +2806,7 @@ def test_fixed_linear_stop_segment_does_not_launch_next_draft():
     assert summary.accepted_from_draft == 6
     assert summary.acceptance_history == (3, 3)
     assert target_ops.verify_calls == 2
+    assert target_ops.verify_settlement_lengths == [4, 4]
     assert target_ops.restore_calls == 2
     assert draft_backend.calls == [(4, True), (4, True)]
 

@@ -2252,7 +2252,7 @@ class SpeculativeSession:
                 capture_layer_ids=self.capture_layer_ids,
             )
             posterior = greedy_tokens_with_mask(verify_logits[0], None)
-            mx.async_eval(posterior)
+            target_ops.schedule_verify_chunk(target_cache, posterior)
             acceptance_len = int(
                 _match_acceptance_length(
                     verify_token_ids[1:],
@@ -3360,6 +3360,13 @@ def stream_dflash_generate_impl(
     ):
         raise ValueError(
             "fixed linear DFlash runtime requires a target prefill settlement "
+            "boundary"
+        )
+    if fixed_linear_runtime and not callable(
+        getattr(target_ops, "schedule_verify_chunk", None)
+    ):
+        raise ValueError(
+            "fixed linear DFlash runtime requires a target verify settlement "
             "boundary"
         )
     prompt_tokens = (
