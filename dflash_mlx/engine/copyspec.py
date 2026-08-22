@@ -13,6 +13,24 @@ _FNV_PRIME = 1099511628211
 _U64_MASK = (1 << 64) - 1
 
 
+class DisabledCopySpecIndex:
+    """Zero-storage CopySpec owner for sessions constructed with CopySpec off."""
+
+    __slots__ = ()
+
+    def draft_after(
+        self,
+        staged_first: int,
+        *,
+        max_tokens: int,
+        forbidden_tokens: set[int] | None = None,
+    ) -> None:
+        return None
+
+    def append_committed(self, token_ids: Sequence[int]) -> None:
+        return None
+
+
 class CopySpecIndex:
     def __init__(
         self,

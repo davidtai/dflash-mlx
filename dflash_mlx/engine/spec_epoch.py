@@ -28,7 +28,11 @@ from dflash_mlx.cache.snapshot import (
 )
 from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
-from dflash_mlx.engine.copyspec import CopySpecAutoGate, CopySpecIndex
+from dflash_mlx.engine.copyspec import (
+    CopySpecAutoGate,
+    CopySpecIndex,
+    DisabledCopySpecIndex,
+)
 from dflash_mlx.engine.ddtree import (
     build_flat_ddtree,
     build_flat_tree_inputs,
@@ -649,7 +653,7 @@ class SpeculativeSession:
     memory_waterfall: bool
     clear_cache_boundaries: bool
     target_fa_window: int
-    copyspec_index: CopySpecIndex
+    copyspec_index: CopySpecIndex | DisabledCopySpecIndex
     copyspec_mode: str
     capture_logits: bool = False
 
@@ -733,6 +737,11 @@ class SpeculativeSession:
         copyspec_mode = str(getattr(runtime_config, "copyspec_mode", "conservative"))
         if not _draft_capability(draft_model, "supports_copyspec", default=True):
             copyspec_mode = "off"
+        copyspec_index = (
+            DisabledCopySpecIndex()
+            if copyspec_mode == "off"
+            else CopySpecIndex(prompt_tokens)
+        )
         return cls(
             target_model=target_model,
             draft_model=draft_model,
@@ -757,7 +766,7 @@ class SpeculativeSession:
             memory_waterfall=memory_waterfall,
             clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
             target_fa_window=target_fa_window,
-            copyspec_index=CopySpecIndex(prompt_tokens),
+            copyspec_index=copyspec_index,
             copyspec_mode=copyspec_mode,
         )
 
@@ -1267,26 +1276,37 @@ class SpeculativeSession:
             else None
         )
 
-        def _copy_draft_for_block(
-            staged_first: mx.array,
-            block_len: int,
-            draft_context: mx.array,
-        ) -> mx.array | None:
-            if self.copyspec_mode == "off" or state.copyspec_disabled:
+        if self.copyspec_mode == "off":
+
+            def _copy_draft_for_block(
+                staged_first: mx.array,
+                block_len: int,
+                draft_context: mx.array,
+            ) -> None:
                 return None
-            candidate = self.copyspec_index.draft_after(
-                int(staged_first.item()),
-                max_tokens=max(0, int(block_len) - 1),
-                forbidden_tokens=forbidden_copy_tokens,
-            )
-            if candidate is None:
-                return None
-            draft_backend.advance_context(
-                draft_model=draft_model,
-                draft_cache=draft_cache,
-                draft_context=draft_context,
-            )
-            return mx.array(candidate, dtype=mx.uint32)
+
+        else:
+
+            def _copy_draft_for_block(
+                staged_first: mx.array,
+                block_len: int,
+                draft_context: mx.array,
+            ) -> mx.array | None:
+                if state.copyspec_disabled:
+                    return None
+                candidate = self.copyspec_index.draft_after(
+                    int(staged_first.item()),
+                    max_tokens=max(0, int(block_len) - 1),
+                    forbidden_tokens=forbidden_copy_tokens,
+                )
+                if candidate is None:
+                    return None
+                draft_backend.advance_context(
+                    draft_model=draft_model,
+                    draft_cache=draft_cache,
+                    draft_context=draft_context,
+                )
+                return mx.array(candidate, dtype=mx.uint32)
 
         def _waterfall_event(
             phase: str,
@@ -2056,28 +2076,39 @@ class SpeculativeSession:
             else None
         )
 
-        def _copy_draft_for_block(
-            staged_first: mx.array,
-            block_len: int,
-            draft_context: mx.array,
-        ) -> mx.array | None:
-            if self.copyspec_mode == "off" or state.copyspec_disabled:
+        if self.copyspec_mode == "off":
+
+            def _copy_draft_for_block(
+                staged_first: mx.array,
+                block_len: int,
+                draft_context: mx.array,
+            ) -> None:
                 return None
-            candidate = self.copyspec_index.draft_after(
-                int(staged_first.item()),
-                max_tokens=max(0, int(block_len) - 1),
-                forbidden_tokens=forbidden_copy_tokens,
-            )
-            if candidate is None:
-                return None
-            if copyspec_auto_gate is not None and not copyspec_auto_gate.engage_copy():
-                return None
-            draft_backend.advance_context(
-                draft_model=draft_model,
-                draft_cache=draft_cache,
-                draft_context=draft_context,
-            )
-            return mx.array(candidate, dtype=mx.uint32)
+
+        else:
+
+            def _copy_draft_for_block(
+                staged_first: mx.array,
+                block_len: int,
+                draft_context: mx.array,
+            ) -> mx.array | None:
+                if state.copyspec_disabled:
+                    return None
+                candidate = self.copyspec_index.draft_after(
+                    int(staged_first.item()),
+                    max_tokens=max(0, int(block_len) - 1),
+                    forbidden_tokens=forbidden_copy_tokens,
+                )
+                if candidate is None:
+                    return None
+                if copyspec_auto_gate is not None and not copyspec_auto_gate.engage_copy():
+                    return None
+                draft_backend.advance_context(
+                    draft_model=draft_model,
+                    draft_cache=draft_cache,
+                    draft_context=draft_context,
+                )
+                return mx.array(candidate, dtype=mx.uint32)
 
         draft_ns_total = 0
         draft_prefill_ns = 0
