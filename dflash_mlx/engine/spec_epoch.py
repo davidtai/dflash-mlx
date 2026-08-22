@@ -2156,16 +2156,21 @@ class SpeculativeSession:
         )
         effective_block_tokens = cycle_config.effective_block_tokens
         verify_len_cap = cycle_config.verify_len_cap
-        block_token_buffer = mx.full(
-            (effective_block_tokens,),
-            int(draft_model.mask_token_id),
-            dtype=mx.uint32,
-        )
-        mask_token_tail = mx.full(
-            (max(0, effective_block_tokens - 1),),
-            int(draft_model.mask_token_id),
-            dtype=mx.uint32,
-        )
+        block_token_buffer: mx.array
+        mask_token_tail: mx.array
+        if max_new_tokens != 1:
+            block_token_buffer = mx.full(
+                (effective_block_tokens,),
+                int(draft_model.mask_token_id),
+                dtype=mx.uint32,
+            )
+            mask_token_tail = mx.full(
+                (max(0, effective_block_tokens - 1),),
+                int(draft_model.mask_token_id),
+                dtype=mx.uint32,
+            )
+        elif max_new_tokens == 1:
+            state.generated_token_ids.append(int(state.staged_first.item()))
         state.start = request.prompt_len
         while len(state.generated_token_ids) < max_new_tokens:
             remaining = max_new_tokens - len(state.generated_token_ids)
@@ -2254,6 +2259,16 @@ class SpeculativeSession:
             state.accepted_from_draft += acceptance_len
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+            stop_hit = False
+            if stop_token_array is not None:
+                stop_hit = bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment[:, None],
+                            stop_token_array[None, :],
+                        )
+                    ).item()
+                )
 
             next_remaining = (
                 max_new_tokens
@@ -2264,7 +2279,7 @@ class SpeculativeSession:
                 1,
                 min(effective_block_tokens, next_remaining),
             )
-            if next_remaining > 0 and next_block_len > 1:
+            if not stop_hit and next_remaining > 0 and next_block_len > 1:
                 next_drafted = draft_backend.draft_greedy(
                     target_model=target_model,
                     target_ops=target_ops,
@@ -2308,16 +2323,6 @@ class SpeculativeSession:
                     copyspec_tokens=0,
                 )
 
-            stop_hit = False
-            if stop_token_array is not None:
-                stop_hit = bool(
-                    mx.any(
-                        mx.equal(
-                            committed_segment[:, None],
-                            stop_token_array[None, :],
-                        )
-                    ).item()
-                )
             if stop_hit:
                 break
             state.staged_first = staged_first_next

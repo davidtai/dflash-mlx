@@ -145,6 +145,58 @@ class _RecordingDraftBackend(_FakeDraftBackend):
         return candidate_ids
 
 
+class _FixedLinearDraftBackend(_RecordingDraftBackend):
+    def make_target_feature_store(
+        self,
+        *,
+        prompt_len,
+        project_context,
+        draft_model,
+        draft_cache,
+    ):
+        del draft_model, draft_cache
+        from dflash_mlx.engine.target_features import TargetFeatureStore
+
+        return TargetFeatureStore(
+            prompt_len=int(prompt_len),
+            project_context=project_context,
+        )
+
+
+class _FixedLinearTargetOps(_FakeTargetOps):
+    def __init__(self, posterior_rows=()) -> None:
+        super().__init__()
+        self.posterior_rows = tuple(tuple(row) for row in posterior_rows)
+        self.verify_calls = 0
+        self.restore_calls = 0
+
+    def capabilities_for(self, _target_model):
+        return SimpleNamespace(
+            supports_prefix_snapshot=False,
+            supports_chunked_prefill=True,
+            supports_tree_verify=False,
+            supports_fixed_linear_runtime=True,
+            fixed_linear_restore_without_arming=True,
+        )
+
+    def verify_block(self, **kwargs):
+        self.verify_calls += 1
+        if self.posterior_rows:
+            verify_ids = kwargs["verify_ids"]
+            batch, seq_len = verify_ids.shape
+            logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+            row = self.posterior_rows[self.verify_calls - 1]
+            for index, token_id in enumerate(row[:seq_len]):
+                logits[:, index, int(token_id)] = 1
+            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+            return logits, hidden
+        return super().verify_block(**kwargs)
+
+    def restore_after_acceptance(self, *_args, **_kwargs) -> int:
+        self.restore_calls += 1
+        return 0
+
+
 class _RecordingL2:
     def __init__(self) -> None:
         self.snapshots: list[DFlashPrefixSnapshot] = []
@@ -191,6 +243,19 @@ def _runtime_context(
             verify_len_cap=0 if verify_len_cap is None else verify_len_cap,
         ),
         diagnostics_config=diagnostics_config,
+    )
+
+
+def _fixed_linear_runtime_context():
+    return build_runtime_context(
+        runtime_config_from_defaults(
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+            verify_mode="dflash",
+            copyspec_mode="off",
+            clear_cache_boundaries=False,
+        )
     )
 
 
@@ -2593,6 +2658,73 @@ def test_stop_token_breaks_after_current_committed_segment():
     assert summary.generation_tokens == 4
     assert summary.cycles_completed == 1
     assert summary.acceptance_history == (3,)
+
+
+def test_fixed_linear_single_prefill_token_skips_terminal_verify():
+    target_ops = _FixedLinearTargetOps()
+    draft_backend = _FixedLinearDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=1,
+            prompt_tokens_override=[1, 2],
+            runtime_context=_fixed_linear_runtime_context(),
+        )
+    )
+
+    token_events = [event for event in events if isinstance(event, TokenEvent)]
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert [event.token_id for event in token_events] == [0]
+    assert summary.generated_token_ids == (0,)
+    assert summary.generation_tokens == 1
+    assert summary.cycles_completed == 0
+    assert summary.accepted_from_draft == 0
+    assert summary.acceptance_history == ()
+    assert target_ops.verify_calls == 0
+    assert target_ops.restore_calls == 0
+    assert draft_backend.calls == []
+
+
+def test_fixed_linear_stop_segment_does_not_launch_next_draft():
+    target_ops = _FixedLinearTargetOps(
+        posterior_rows=((0, 0, 0, 1), (0, 0, 0, 0)),
+    )
+    draft_backend = _FixedLinearDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=12,
+            prompt_tokens_override=[1, 2],
+            stop_token_ids=[1],
+            runtime_context=_fixed_linear_runtime_context(),
+        )
+    )
+
+    token_events = [event for event in events if isinstance(event, TokenEvent)]
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert [event.token_id for event in token_events] == [0, 0, 0, 0, 1, 0, 0, 0]
+    assert summary.generated_token_ids == (0, 0, 0, 0, 1, 0, 0, 0)
+    assert summary.generation_tokens == 8
+    assert summary.cycles_completed == 2
+    assert summary.accepted_from_draft == 6
+    assert summary.acceptance_history == (3, 3)
+    assert target_ops.verify_calls == 2
+    assert target_ops.restore_calls == 2
+    assert draft_backend.calls == [(4, True), (4, True)]
 
 
 def test_stream_close_cleans_session_caches():
