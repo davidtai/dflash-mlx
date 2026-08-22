@@ -24,6 +24,7 @@ class TargetCapabilities:
     supports_tree_verify: bool = False
     supports_chunked_prefill: bool = False
     supports_fixed_linear_runtime: bool = False
+    fixed_linear_restore_without_arming: bool = False
 
 class TargetOps(Protocol):
     backend_name: str

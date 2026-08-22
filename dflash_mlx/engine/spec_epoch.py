@@ -2142,7 +2142,6 @@ class SpeculativeSession:
         first_token_yielded = False
         if max_new_tokens > 0:
             first_token_yielded = True
-            assert state.staged_first is not None
             yield TokenEvent(
                 token_id=int(state.staged_first.item()),
                 generated_tokens=1,
@@ -2172,7 +2171,6 @@ class SpeculativeSession:
             remaining = max_new_tokens - len(state.generated_token_ids)
             block_len = max(1, min(effective_block_tokens, remaining))
             block_token_buffer[:block_len] = int(draft_model.mask_token_id)
-            assert state.staged_first is not None
             block_token_buffer[:1] = state.staged_first
             block_token_ids = block_token_buffer[:block_len]
             current_staged_first = state.staged_first
@@ -2216,7 +2214,6 @@ class SpeculativeSession:
                     axis=0,
                 )
             )
-            target_ops.arm_rollback(target_cache, prefix_len=state.start)
             verify_logits, captured = target_ops.verify_block(
                 target_model=target_model,
                 verify_ids=verify_token_ids[None],
@@ -3312,6 +3309,17 @@ def stream_dflash_generate_impl(
     fixed_linear_runtime = bool(
         getattr(target_capabilities, "supports_fixed_linear_runtime", False)
     )
+    if fixed_linear_runtime and not bool(
+        getattr(
+            target_capabilities,
+            "fixed_linear_restore_without_arming",
+            False,
+        )
+    ):
+        raise ValueError(
+            "fixed linear DFlash runtime requires direct acceptance restore "
+            "without per-cycle rollback arming"
+        )
     prompt_tokens = (
         list(prompt_tokens_override)
         if prompt_tokens_override is not None
