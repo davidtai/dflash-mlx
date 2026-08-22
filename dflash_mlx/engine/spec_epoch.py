@@ -655,6 +655,7 @@ class SpeculativeSession:
     target_fa_window: int
     copyspec_index: CopySpecIndex | DisabledCopySpecIndex
     copyspec_mode: str
+    fixed_linear_runtime: bool
     capture_logits: bool = False
 
     @classmethod
@@ -667,6 +668,7 @@ class SpeculativeSession:
         target_ops: Any,
         supports_prefix_snapshot: bool,
         supports_chunked_prefill: bool,
+        fixed_linear_runtime: bool = False,
         allow_full_context_draft_layers: bool,
         prompt_tokens: Sequence[int],
         max_new_tokens: int,
@@ -676,6 +678,39 @@ class SpeculativeSession:
         runtime_context: Any,
     ) -> "SpeculativeSession":
         runtime_config = runtime_context.runtime
+        diagnostics = runtime_context.diagnostics
+        profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
+        memory_waterfall = _memory_waterfall_enabled(diagnostics)
+        if fixed_linear_runtime:
+            fixed_contract = (
+                bool(supports_prefix_snapshot),
+                bool(supports_chunked_prefill),
+                bool(allow_full_context_draft_layers),
+                str(getattr(runtime_config, "verify_mode", "")),
+                str(getattr(runtime_config, "copyspec_mode", "")),
+                bool(getattr(runtime_config, "clear_cache_boundaries", False)),
+                bool(profile_cycles),
+                bool(memory_waterfall),
+                callable(
+                    getattr(draft_backend, "make_target_feature_store", None)
+                ),
+            )
+            required_fixed_contract = (
+                False,
+                True,
+                False,
+                "dflash",
+                "off",
+                False,
+                False,
+                False,
+                True,
+            )
+            if fixed_contract != required_fixed_contract:
+                raise ValueError(
+                    "fixed linear DFlash runtime contract changed: "
+                    f"{fixed_contract!r} != {required_fixed_contract!r}"
+                )
         draft_sink_size, draft_window_size = resolve_draft_window(
             runtime_config,
             draft_model,
@@ -730,10 +765,11 @@ class SpeculativeSession:
             window_size=draft_window_size,
             allow_full_context_layers=allow_full_context_draft_layers,
         )
-        diagnostics = runtime_context.diagnostics
-        profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
-        memory_waterfall = _memory_waterfall_enabled(diagnostics)
-        capture_logits = os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
+        capture_logits = (
+            False
+            if fixed_linear_runtime
+            else os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
+        )
         copyspec_mode = str(getattr(runtime_config, "copyspec_mode", "conservative"))
         if not _draft_capability(draft_model, "supports_copyspec", default=True):
             copyspec_mode = "off"
@@ -768,6 +804,7 @@ class SpeculativeSession:
             target_fa_window=target_fa_window,
             copyspec_index=copyspec_index,
             copyspec_mode=copyspec_mode,
+            fixed_linear_runtime=bool(fixed_linear_runtime),
         )
 
     def clear_cache_boundary(self) -> None:
@@ -799,6 +836,114 @@ class SpeculativeSession:
                 gen_hidden_chunks=gen_hidden_chunks_value,
                 extra=extra,
             ),
+        )
+
+    def _run_fixed_linear_prefill_events(
+        self,
+        *,
+        request: _SessionRequest,
+        state: "_RequestState",
+    ) -> Generator[EngineEvent, None, _PrefillResult]:
+        """Chunked prefill for a construction-qualified linear-only target.
+
+        Prefix snapshots, sparse prompt positions, diagnostics, cache clearing,
+        and suppression are absent from this installed lane.  The arithmetic
+        and event ordering are the corresponding direct subset of
+        :meth:`_run_prefill_events`.
+        """
+        target_ops = self.target_ops
+        target_model = self.target_model
+        draft_model = self.draft_model
+        prompt_array = request.prompt_array
+        prompt_len = request.prompt_len
+        feature_store = self.draft_backend.make_target_feature_store(
+            prompt_len=prompt_len,
+            project_context=draft_model.project_target_hidden,
+            draft_model=draft_model,
+            draft_cache=self.draft_cache,
+        )
+        start_ns = time.perf_counter_ns()
+        prefill_start_ns = time.perf_counter_ns()
+        prefill_step_size = int(self.runtime_config.prefill_step_size)
+        prefill_context_len = max(0, prompt_len - 1)
+
+        for chunk_start in range(0, prefill_context_len, prefill_step_size):
+            chunk_end = min(
+                chunk_start + prefill_step_size,
+                prefill_context_len,
+            )
+            state.prefill_logits, captured = target_ops.forward_with_hidden_capture(
+                target_model,
+                input_ids=prompt_array[:, chunk_start:chunk_end],
+                cache=self.target_cache,
+                capture_layer_ids=self.capture_layer_ids,
+                logits_last_only=True,
+            )
+            eval_logits_and_captured(state.prefill_logits, captured)
+            feature_store.write_prompt_slice(
+                start=chunk_start,
+                end=chunk_end,
+                features=target_ops.extract_context_feature(
+                    captured,
+                    self.target_layer_id_list,
+                ),
+            )
+            del captured
+            yield PrefillProgressEvent(
+                tokens_processed=int(chunk_end),
+                tokens_total=int(prompt_len),
+            )
+
+        if prompt_len <= 0:
+            raise ValueError("fixed linear DFlash prefill requires a nonempty prompt")
+        final_prompt_start = prompt_len - 1
+        state.prefill_logits, captured = target_ops.forward_with_hidden_capture(
+            target_model,
+            input_ids=prompt_array[:, final_prompt_start:prompt_len],
+            cache=self.target_cache,
+            capture_layer_ids=self.capture_layer_ids,
+            logits_last_only=True,
+        )
+        eval_logits_and_captured(state.prefill_logits, captured)
+        feature_store.write_prompt_slice(
+            start=final_prompt_start,
+            end=prompt_len,
+            features=target_ops.extract_context_feature(
+                captured,
+                self.target_layer_id_list,
+            ),
+        )
+        del captured
+        yield PrefillProgressEvent(
+            tokens_processed=int(prompt_len),
+            tokens_total=int(prompt_len),
+        )
+
+        prefill_ns = time.perf_counter_ns() - prefill_start_ns
+        state.staged_first = greedy_tokens_with_mask(
+            state.prefill_logits[:, -1, :],
+            None,
+        ).reshape(-1)
+        yield PrefillCompleteEvent(
+            prefill_us=prefill_ns / 1_000.0,
+            prompt_token_count=int(prompt_len),
+            snap_prefix_len=0,
+            snapshot_boundary=int(prompt_len),
+            logical_ctx_tokens=int(prompt_len),
+            physical_prefill_tokens=int(prompt_len),
+            prefill_tokens_restored=0,
+            prefill_tokens_computed=int(prompt_len),
+            phase_rebuild_us=None,
+            phase_cold_us=None,
+            phase_seam_us=None,
+            phase_tail_us=None,
+        )
+        return _PrefillResult(
+            feature_store=feature_store,
+            start_ns=start_ns,
+            prefill_ns=prefill_ns,
+            suppress_token_mask=None,
+            supports_prefix_snapshot=False,
         )
 
     def _run_prefill_events(
@@ -1970,6 +2115,245 @@ class SpeculativeSession:
             copyspec_tokens=int(copyspec_tokens_total),
         )
 
+    def _run_fixed_linear_decode_events(
+        self,
+        *,
+        request: _SessionRequest,
+        state: "_RequestState",
+        prefill: _PrefillResult,
+    ) -> Generator[EngineEvent, None, _DecodeResult]:
+        """Fixed DFlash linear epochs with disabled policies compiled out.
+
+        This is the direct non-profiled, non-adaptive, non-CopySpec subset of
+        :meth:`_run_decode_events`.  Target verification, greedy acceptance,
+        feature commit, target rollback, asynchronous next-draft launch, token
+        ordering, and stop handling remain identical to the shared engine.
+        """
+        target_ops = self.target_ops
+        draft_backend = self.draft_backend
+        draft_model = self.draft_model
+        target_model = self.target_model
+        target_cache = self.target_cache
+        draft_cache = self.draft_cache
+        feature_store = prefill.feature_store
+        max_new_tokens = request.max_new_tokens
+        stop_token_array = request.stop_token_array
+
+        first_token_yielded = False
+        if max_new_tokens > 0:
+            first_token_yielded = True
+            assert state.staged_first is not None
+            yield TokenEvent(
+                token_id=int(state.staged_first.item()),
+                generated_tokens=1,
+                acceptance_ratio=0.0,
+                cycles_completed=0,
+            )
+
+        cycle_config = resolve_speculative_cycle_config(
+            self.runtime_config,
+            draft_model,
+            request.block_tokens,
+        )
+        effective_block_tokens = cycle_config.effective_block_tokens
+        verify_len_cap = cycle_config.verify_len_cap
+        block_token_buffer = mx.full(
+            (effective_block_tokens,),
+            int(draft_model.mask_token_id),
+            dtype=mx.uint32,
+        )
+        mask_token_tail = mx.full(
+            (max(0, effective_block_tokens - 1),),
+            int(draft_model.mask_token_id),
+            dtype=mx.uint32,
+        )
+        state.start = request.prompt_len
+        while len(state.generated_token_ids) < max_new_tokens:
+            remaining = max_new_tokens - len(state.generated_token_ids)
+            block_len = max(1, min(effective_block_tokens, remaining))
+            block_token_buffer[:block_len] = int(draft_model.mask_token_id)
+            assert state.staged_first is not None
+            block_token_buffer[:1] = state.staged_first
+            block_token_ids = block_token_buffer[:block_len]
+            current_staged_first = state.staged_first
+            drafted = None
+
+            if block_len > 1:
+                if (
+                    state.prefetched_draft is not None
+                    and int(state.prefetched_draft["block_len"]) == block_len
+                ):
+                    drafted = state.prefetched_draft["drafted"]
+                    current_staged_first = state.prefetched_draft["staged_first"]
+                else:
+                    drafted = draft_backend.draft_greedy(
+                        target_model=target_model,
+                        target_ops=target_ops,
+                        draft_model=draft_model,
+                        draft_cache=draft_cache,
+                        staged_first=current_staged_first,
+                        draft_context=feature_store.require_current_hidden(),
+                        block_len=block_len,
+                        mask_token_tail=mask_token_tail,
+                        suppress_token_mask=None,
+                        async_launch=True,
+                    )
+                state.prefetched_draft = None
+                block_token_ids[1:block_len] = drafted
+
+            verify_token_count = verify_token_count_for_block(
+                block_len,
+                verify_len_cap,
+            )
+            verify_token_ids = (
+                current_staged_first[:1]
+                if verify_token_count <= 1
+                else mx.concatenate(
+                    [
+                        current_staged_first[:1],
+                        drafted[: verify_token_count - 1],
+                    ],
+                    axis=0,
+                )
+            )
+            target_ops.arm_rollback(target_cache, prefix_len=state.start)
+            verify_logits, captured = target_ops.verify_block(
+                target_model=target_model,
+                verify_ids=verify_token_ids[None],
+                target_cache=target_cache,
+                capture_layer_ids=self.capture_layer_ids,
+            )
+            posterior = greedy_tokens_with_mask(verify_logits[0], None)
+            mx.async_eval(posterior)
+            acceptance_len = int(
+                _match_acceptance_length(
+                    verify_token_ids[1:],
+                    posterior[:-1],
+                ).item()
+            )
+            state.acceptance_history.append(acceptance_len)
+            committed_hidden = target_ops.extract_context_feature(
+                captured,
+                self.target_layer_id_list,
+            )[:, : (1 + acceptance_len), :]
+            mx.async_eval(committed_hidden)
+            del captured
+
+            commit_count = 1 + acceptance_len
+            committed_segment = verify_token_ids[:commit_count]
+            state.start += commit_count
+            feature_store.commit_generation(
+                committed_hidden,
+                collect_snapshot=False,
+            )
+            state.last_cycle_logits = verify_logits[:, acceptance_len, :]
+            target_ops.restore_after_acceptance(
+                target_cache,
+                target_len=state.start,
+                acceptance_length=acceptance_len,
+                drafted_tokens=max(0, verify_token_count - 1),
+            )
+            state.cycles_completed += 1
+            state.accepted_from_draft += acceptance_len
+            staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+
+            next_remaining = (
+                max_new_tokens
+                - len(state.generated_token_ids)
+                - commit_count
+            )
+            next_block_len = max(
+                1,
+                min(effective_block_tokens, next_remaining),
+            )
+            if next_remaining > 0 and next_block_len > 1:
+                next_drafted = draft_backend.draft_greedy(
+                    target_model=target_model,
+                    target_ops=target_ops,
+                    draft_model=draft_model,
+                    draft_cache=draft_cache,
+                    staged_first=staged_first_next,
+                    draft_context=feature_store.require_current_hidden(),
+                    block_len=next_block_len,
+                    mask_token_tail=mask_token_tail,
+                    suppress_token_mask=None,
+                    async_launch=True,
+                )
+                state.prefetched_draft = {
+                    "block_len": next_block_len,
+                    "staged_first": staged_first_next,
+                    "drafted": next_drafted,
+                }
+            else:
+                state.prefetched_draft = None
+
+            for token_id in committed_ids:
+                if len(state.generated_token_ids) >= max_new_tokens:
+                    break
+                state.generated_token_ids.append(token_id)
+                if first_token_yielded:
+                    first_token_yielded = False
+                    continue
+                yield TokenEvent(
+                    token_id=int(token_id),
+                    generated_tokens=len(state.generated_token_ids),
+                    acceptance_ratio=(
+                        state.accepted_from_draft / len(state.generated_token_ids)
+                        if state.generated_token_ids
+                        else 0.0
+                    ),
+                    cycles_completed=int(state.cycles_completed),
+                    adaptive_block_reductions=0,
+                    adaptive_block_cycles=0,
+                    adaptive_block_min=None,
+                    copyspec_hits=0,
+                    copyspec_tokens=0,
+                )
+
+            stop_hit = False
+            if stop_token_array is not None:
+                stop_hit = bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment[:, None],
+                            stop_token_array[None, :],
+                        )
+                    ).item()
+                )
+            if stop_hit:
+                break
+            state.staged_first = staged_first_next
+
+        return _DecodeResult(
+            effective_block_tokens=effective_block_tokens,
+            verify_len_cap=verify_len_cap,
+            adaptive_block_reductions=0,
+            adaptive_block_cycles=0,
+            adaptive_block_min=None,
+            draft_ns_total=0,
+            draft_prefill_ns=0,
+            draft_incremental_ns=0,
+            verify_ns_total=0,
+            replay_ns_total=0,
+            commit_ns_total=0,
+            cycle_profiles=(),
+            profile_totals_ns={
+                "draft": 0,
+                "verify": 0,
+                "acceptance": 0,
+                "hidden_extraction": 0,
+                "commit": 0,
+                "rollback": 0,
+                "other": 0,
+                "cycle_total": 0,
+                "cycle_wall": 0,
+                "yield_pause": 0,
+            },
+            copyspec_hits=0,
+            copyspec_tokens=0,
+        )
+
     def _run_decode_events(
         self,
         *,
@@ -2648,14 +3032,24 @@ class SpeculativeSession:
         yield_pause = _YieldPauseTracker(enabled=bool(profile_cycles or memory_waterfall))
         state = _RequestState()
 
-        sparse_rope_saved = self._install_sparse_prefill_rope(request)
+        sparse_rope_saved = (
+            None
+            if self.fixed_linear_runtime
+            else self._install_sparse_prefill_rope(request)
+        )
 
         try:
-            prefill = yield from self._run_prefill_events(
-                request=request,
-                state=state,
-                yield_pause=yield_pause,
-            )
+            if self.fixed_linear_runtime:
+                prefill = yield from self._run_fixed_linear_prefill_events(
+                    request=request,
+                    state=state,
+                )
+            else:
+                prefill = yield from self._run_prefill_events(
+                    request=request,
+                    state=state,
+                    yield_pause=yield_pause,
+                )
             feature_store = prefill.feature_store
             start_ns = prefill.start_ns
             prefill_ns = prefill.prefill_ns
@@ -2667,20 +3061,27 @@ class SpeculativeSession:
                     decode_position_adjustment(request.prompt_token_positions),
                 )
 
-            decode = yield from self._run_decode_events(
-                request=request,
-                state=state,
-                prefill=prefill,
-                yield_pause=yield_pause,
-            )
+            if self.fixed_linear_runtime:
+                decode = yield from self._run_fixed_linear_decode_events(
+                    request=request,
+                    state=state,
+                    prefill=prefill,
+                )
+            else:
+                decode = yield from self._run_decode_events(
+                    request=request,
+                    state=state,
+                    prefill=prefill,
+                    yield_pause=yield_pause,
+                )
 
-            yield from self._run_generation_snapshot_events(
-                request=request,
-                state=state,
-                feature_store=feature_store,
-                supports_prefix_snapshot=supports_prefix_snapshot,
-                yield_pause=yield_pause,
-            )
+                yield from self._run_generation_snapshot_events(
+                    request=request,
+                    state=state,
+                    feature_store=feature_store,
+                    supports_prefix_snapshot=supports_prefix_snapshot,
+                    yield_pause=yield_pause,
+                )
 
             elapsed_us = (time.perf_counter_ns() - start_ns - yield_pause.pause_ns) / 1_000.0
             first_20 = state.acceptance_history[:20]
@@ -2908,6 +3309,9 @@ def stream_dflash_generate_impl(
             supports_prefix_snapshot,
         )
     )
+    fixed_linear_runtime = bool(
+        getattr(target_capabilities, "supports_fixed_linear_runtime", False)
+    )
     prompt_tokens = (
         list(prompt_tokens_override)
         if prompt_tokens_override is not None
@@ -2932,6 +3336,11 @@ def stream_dflash_generate_impl(
         min_ctx=int(runtime_config.draft_full_context_min_ctx),
     )
     if projected_ctx >= dflash_max_ctx:
+        if fixed_linear_runtime:
+            raise ValueError(
+                "fixed linear DFlash runtime context boundary exceeded: "
+                f"projected_ctx={projected_ctx} >= DFLASH_MAX_CTX={dflash_max_ctx}"
+            )
         fallback_reason = (
             f"projected_ctx={projected_ctx} "
             f"(prompt_len={prompt_len}, max_new_tokens={int(max_new_tokens)}) "
@@ -2965,6 +3374,19 @@ def stream_dflash_generate_impl(
         prefix_hit_kind=prefix_hit_kind,
         prompt_token_positions=prompt_token_positions,
     )
+    if fixed_linear_runtime and (
+        request.prefix_snapshot is not None
+        or request.snapshot_service is not None
+        or request.stable_prefix_len is not None
+        or request.prefix_cache_active
+        or request.suppress_token_ids is not None
+        or request.prompt_token_positions is not None
+    ):
+        raise ValueError(
+            "fixed linear DFlash runtime does not install snapshots, token "
+            "suppression, stable prefix state, prefix cache, or sparse prompt "
+            "positions"
+        )
 
     session = SpeculativeSession.open(
         target_model=target_model,
@@ -2973,6 +3395,7 @@ def stream_dflash_generate_impl(
         target_ops=target_ops,
         supports_prefix_snapshot=supports_prefix_snapshot,
         supports_chunked_prefill=supports_chunked_prefill,
+        fixed_linear_runtime=fixed_linear_runtime,
         allow_full_context_draft_layers=allow_full_context_draft_layers,
         prompt_tokens=request.prompt_tokens,
         max_new_tokens=max_new_tokens,

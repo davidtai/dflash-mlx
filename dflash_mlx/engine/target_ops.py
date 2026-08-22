@@ -23,6 +23,7 @@ class TargetCapabilities:
     supports_full_context_draft_layers: bool = False
     supports_tree_verify: bool = False
     supports_chunked_prefill: bool = False
+    supports_fixed_linear_runtime: bool = False
 
 class TargetOps(Protocol):
     backend_name: str

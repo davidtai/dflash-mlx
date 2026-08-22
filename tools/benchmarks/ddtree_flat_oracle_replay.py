@@ -190,6 +190,13 @@ def run_request(
             True,
         )
     )
+    supports_chunked_prefill = bool(
+        getattr(
+            bundle.target_ops.capabilities_for(bundle.target_model),
+            "supports_chunked_prefill",
+            supports_prefix_snapshot,
+        )
+    )
     allow_full_context_draft_layers = bool(
         getattr(
             bundle.target_ops.capabilities_for(bundle.target_model),
@@ -203,6 +210,8 @@ def run_request(
         draft_backend=bundle.draft_backend,
         target_ops=bundle.target_ops,
         supports_prefix_snapshot=supports_prefix_snapshot,
+        supports_chunked_prefill=supports_chunked_prefill,
+        fixed_linear_runtime=False,
         allow_full_context_draft_layers=allow_full_context_draft_layers,
         prompt_tokens=prompt_tokens,
         max_new_tokens=max_output_tokens,
