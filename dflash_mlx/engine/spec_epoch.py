@@ -888,7 +888,11 @@ class SpeculativeSession:
                 capture_layer_ids=self.capture_layer_ids,
                 logits_last_only=True,
             )
-            eval_logits_and_captured(state.prefill_logits, captured)
+            target_ops.settle_prefill_chunk(
+                self.target_cache,
+                state.prefill_logits,
+                captured,
+            )
             feature_store.write_prompt_slice(
                 start=chunk_start,
                 end=chunk_end,
@@ -913,7 +917,11 @@ class SpeculativeSession:
             capture_layer_ids=self.capture_layer_ids,
             logits_last_only=True,
         )
-        eval_logits_and_captured(state.prefill_logits, captured)
+        target_ops.settle_prefill_chunk(
+            self.target_cache,
+            state.prefill_logits,
+            captured,
+        )
         feature_store.write_prompt_slice(
             start=final_prompt_start,
             end=prompt_len,
@@ -3346,6 +3354,13 @@ def stream_dflash_generate_impl(
         raise ValueError(
             "fixed linear DFlash runtime requires direct acceptance restore "
             "without per-cycle rollback arming"
+        )
+    if fixed_linear_runtime and not callable(
+        getattr(target_ops, "settle_prefill_chunk", None)
+    ):
+        raise ValueError(
+            "fixed linear DFlash runtime requires a target prefill settlement "
+            "boundary"
         )
     prompt_tokens = (
         list(prompt_tokens_override)

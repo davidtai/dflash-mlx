@@ -68,6 +68,13 @@ class TargetOps(Protocol):
         logits_last_only: bool = False,
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]: ...
 
+    def settle_prefill_chunk(
+        self,
+        cache_entries: list[Any],
+        logits: mx.array,
+        captured: list[mx.array] | dict[int, mx.array],
+    ) -> None: ...
+
     def verify_block(
         self,
         *,

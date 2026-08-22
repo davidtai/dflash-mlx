@@ -171,6 +171,7 @@ class _FixedLinearTargetOps(_FakeTargetOps):
         self.verify_lengths: list[int] = []
         self.restore_calls = 0
         self.restore_arguments: list[tuple[int, int, int]] = []
+        self.prefill_settlement_lengths: list[int] = []
 
     def capabilities_for(self, _target_model):
         return SimpleNamespace(
@@ -180,6 +181,14 @@ class _FixedLinearTargetOps(_FakeTargetOps):
             supports_fixed_linear_runtime=True,
             fixed_linear_restore_without_arming=True,
         )
+
+    def settle_prefill_chunk(self, cache_entries, logits, captured):
+        del cache_entries
+        self.prefill_settlement_lengths.append(self.forward_lengths[-1])
+        if isinstance(captured, dict):
+            mx.eval(logits, *captured.values())
+        else:
+            mx.eval(logits, *captured)
 
     def verify_block(self, **kwargs):
         self.verify_calls += 1
@@ -2702,7 +2711,29 @@ def test_fixed_linear_single_prefill_token_skips_terminal_verify():
     assert summary.acceptance_history == ()
     assert target_ops.verify_calls == 0
     assert target_ops.restore_calls == 0
+    assert target_ops.prefill_settlement_lengths == [1, 1]
     assert draft_backend.calls == []
+
+
+def test_fixed_linear_prefill_settles_each_chunk_including_final_m1():
+    target_ops = _FixedLinearTargetOps()
+
+    list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=_FixedLinearDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(10)),
+            runtime_context=_fixed_linear_runtime_context(),
+        )
+    )
+
+    assert target_ops.forward_lengths == [4, 4, 1, 1]
+    assert target_ops.prefill_settlement_lengths == [4, 4, 1, 1]
 
 
 def test_fixed_linear_capability_keeps_physical_width_at_output_tail():
