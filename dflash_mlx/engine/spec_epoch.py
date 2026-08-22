@@ -656,6 +656,7 @@ class SpeculativeSession:
     copyspec_index: CopySpecIndex | DisabledCopySpecIndex
     copyspec_mode: str
     fixed_linear_runtime: bool
+    fixed_physical_block: bool
     capture_logits: bool = False
 
     @classmethod
@@ -805,6 +806,14 @@ class SpeculativeSession:
             copyspec_index=copyspec_index,
             copyspec_mode=copyspec_mode,
             fixed_linear_runtime=bool(fixed_linear_runtime),
+            fixed_physical_block=bool(
+                fixed_linear_runtime
+                and _draft_capability(
+                    draft_model,
+                    "fixed_physical_block",
+                    default=False,
+                )
+            ),
         )
 
     def clear_cache_boundary(self) -> None:
@@ -2156,6 +2165,9 @@ class SpeculativeSession:
         )
         effective_block_tokens = cycle_config.effective_block_tokens
         verify_len_cap = cycle_config.verify_len_cap
+        minimum_physical_block_tokens = (
+            effective_block_tokens if self.fixed_physical_block else 1
+        )
         block_token_buffer: mx.array
         mask_token_tail: mx.array
         if max_new_tokens != 1:
@@ -2174,7 +2186,13 @@ class SpeculativeSession:
         state.start = request.prompt_len
         while len(state.generated_token_ids) < max_new_tokens:
             remaining = max_new_tokens - len(state.generated_token_ids)
-            block_len = max(1, min(effective_block_tokens, remaining))
+            block_len = max(
+                1,
+                min(
+                    effective_block_tokens,
+                    max(remaining, minimum_physical_block_tokens),
+                ),
+            )
             block_token_buffer[:block_len] = int(draft_model.mask_token_id)
             block_token_buffer[:1] = state.staged_first
             block_token_ids = block_token_buffer[:block_len]
@@ -2233,6 +2251,7 @@ class SpeculativeSession:
                     posterior[:-1],
                 ).item()
             )
+            acceptance_len = min(acceptance_len, max(0, remaining - 1))
             state.acceptance_history.append(acceptance_len)
             committed_hidden = target_ops.extract_context_feature(
                 captured,
@@ -2277,7 +2296,10 @@ class SpeculativeSession:
             )
             next_block_len = max(
                 1,
-                min(effective_block_tokens, next_remaining),
+                min(
+                    effective_block_tokens,
+                    max(next_remaining, minimum_physical_block_tokens),
+                ),
             )
             if not stop_hit and next_remaining > 0 and next_block_len > 1:
                 next_drafted = draft_backend.draft_greedy(

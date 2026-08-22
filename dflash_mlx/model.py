@@ -333,6 +333,7 @@ class DraftRuntimeCapabilities:
     supports_copyspec: bool = True
     supports_ddtree: bool = True
     supports_early_rollback_launch: bool = True
+    fixed_physical_block: bool = False
 
 
 class DFlashAttention(nn.Module):

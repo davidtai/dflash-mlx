@@ -168,7 +168,9 @@ class _FixedLinearTargetOps(_FakeTargetOps):
         super().__init__()
         self.posterior_rows = tuple(tuple(row) for row in posterior_rows)
         self.verify_calls = 0
+        self.verify_lengths: list[int] = []
         self.restore_calls = 0
+        self.restore_arguments: list[tuple[int, int, int]] = []
 
     def capabilities_for(self, _target_model):
         return SimpleNamespace(
@@ -181,6 +183,7 @@ class _FixedLinearTargetOps(_FakeTargetOps):
 
     def verify_block(self, **kwargs):
         self.verify_calls += 1
+        self.verify_lengths.append(int(kwargs["verify_ids"].shape[1]))
         if self.posterior_rows:
             verify_ids = kwargs["verify_ids"]
             batch, seq_len = verify_ids.shape
@@ -192,8 +195,15 @@ class _FixedLinearTargetOps(_FakeTargetOps):
             return logits, hidden
         return super().verify_block(**kwargs)
 
-    def restore_after_acceptance(self, *_args, **_kwargs) -> int:
+    def restore_after_acceptance(self, *_args, **kwargs) -> int:
         self.restore_calls += 1
+        self.restore_arguments.append(
+            (
+                int(kwargs["target_len"]),
+                int(kwargs["acceptance_length"]),
+                int(kwargs["drafted_tokens"]),
+            )
+        )
         return 0
 
 
@@ -259,13 +269,16 @@ def _fixed_linear_runtime_context():
     )
 
 
-def _draft_model(*, block_size: int = 4):
-    return SimpleNamespace(
+def _draft_model(*, block_size: int = 4, fixed_physical_block: bool = False):
+    draft = SimpleNamespace(
         target_layer_ids=[0],
         block_size=block_size,
         mask_token_id=0,
         project_target_hidden=lambda value: value,
     )
+    if fixed_physical_block:
+        draft.capabilities = SimpleNamespace(fixed_physical_block=True)
+    return draft
 
 
 class _TokenizingTokenizer:
@@ -2690,6 +2703,37 @@ def test_fixed_linear_single_prefill_token_skips_terminal_verify():
     assert target_ops.verify_calls == 0
     assert target_ops.restore_calls == 0
     assert draft_backend.calls == []
+
+
+def test_fixed_linear_capability_keeps_physical_width_at_output_tail():
+    target_ops = _FixedLinearTargetOps(
+        posterior_rows=((0, 0, 0, 0), (0, 0, 0, 0)),
+    )
+    draft_backend = _FixedLinearDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(fixed_physical_block=True),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=6,
+            prompt_tokens_override=[1, 2],
+            runtime_context=_fixed_linear_runtime_context(),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert target_ops.verify_lengths == [4, 4]
+    assert target_ops.restore_arguments == [(6, 3, 3), (8, 1, 3)]
+    assert draft_backend.calls == [(4, True), (4, True)]
+    assert summary.generated_token_ids == (0, 0, 0, 0, 0, 0)
+    assert summary.generation_tokens == 6
+    assert summary.accepted_from_draft == 4
+    assert summary.acceptance_history == (3, 1)
 
 
 def test_fixed_linear_stop_segment_does_not_launch_next_draft():
