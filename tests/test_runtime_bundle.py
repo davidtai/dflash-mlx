@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from dflash_mlx import runtime
 from dflash_mlx.runtime import bundle as runtime_bundle
 from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime.registry import (
@@ -29,6 +30,10 @@ EXPECTED_DRAFT_REGISTRY = {
     "gemma-4-31b-it": "z-lab/gemma-4-31B-it-DFlash",
     "gemma-4-26b-a4b-it": "z-lab/gemma-4-26B-A4B-it-DFlash",
 }
+
+
+def test_runtime_exports_cancellation_exception():
+    assert issubclass(runtime.DFlashGenerationCancelled, RuntimeError)
 
 
 def _loaded_target(target_model, tokenizer, meta, ops):
@@ -133,6 +138,53 @@ def test_runtime_stream_requires_owned_dependencies():
         stream = stream_dflash_generate(**kwargs)
         with pytest.raises(ValueError, match=message):
             next(stream)
+
+
+def test_runtime_stream_forwards_per_request_prefill_step_size(monkeypatch):
+    from dflash_mlx.engine import spec_epoch
+
+    calls = []
+
+    def _stream_impl(**kwargs):
+        calls.append(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(spec_epoch, "stream_dflash_generate_impl", _stream_impl)
+
+    list(
+        stream_dflash_generate(
+            target_ops=object(),
+            draft_backend=object(),
+            prefill_step_size=1024,
+            runtime_context=object(),
+        )
+    )
+
+    assert calls[0]["prefill_step_size"] == 1024
+
+
+def test_runtime_stream_forwards_cancellation_callback(monkeypatch):
+    from dflash_mlx.engine import spec_epoch
+
+    calls = []
+    should_cancel = lambda: False
+
+    def _stream_impl(**kwargs):
+        calls.append(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(spec_epoch, "stream_dflash_generate_impl", _stream_impl)
+
+    list(
+        stream_dflash_generate(
+            target_ops=object(),
+            draft_backend=object(),
+            should_cancel=should_cancel,
+            runtime_context=object(),
+        )
+    )
+
+    assert calls[0]["should_cancel"] is should_cancel
 
 
 def test_runtime_bundle_unknown_target_without_draft_fails_clearly(monkeypatch):

@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from collections import deque
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -82,6 +82,7 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
+from dflash_mlx.engine.exceptions import DFlashGenerationCancelled
 from dflash_mlx.model import DFlashDraftModel
 from dflash_mlx.engine.memory_waterfall import (
     collect_memory_waterfall as _collect_memory_waterfall,
@@ -657,6 +658,8 @@ class SpeculativeSession:
     copyspec_mode: str
     fixed_linear_runtime: bool
     fixed_physical_block: bool
+    prefill_step_size: int
+    should_cancel: Callable[[], bool] | None
     capture_logits: bool = False
 
     @classmethod
@@ -677,8 +680,17 @@ class SpeculativeSession:
         quantize_kv_cache: bool,
         target_fa_window: int,
         runtime_context: Any,
+        prefill_step_size: int | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> "SpeculativeSession":
         runtime_config = runtime_context.runtime
+        resolved_prefill_step_size = int(
+            runtime_config.prefill_step_size
+            if prefill_step_size is None
+            else prefill_step_size
+        )
+        if resolved_prefill_step_size <= 0:
+            raise ValueError("prefill_step_size must be > 0")
         diagnostics = runtime_context.diagnostics
         profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
         memory_waterfall = _memory_waterfall_enabled(diagnostics)
@@ -814,7 +826,13 @@ class SpeculativeSession:
                     default=False,
                 )
             ),
+            prefill_step_size=resolved_prefill_step_size,
+            should_cancel=should_cancel,
         )
+
+    def _raise_if_cancelled(self) -> None:
+        if self.should_cancel is not None and self.should_cancel():
+            raise DFlashGenerationCancelled("DFlash generation cancelled")
 
     def clear_cache_boundary(self) -> None:
         if not self.clear_cache_boundaries:
@@ -873,7 +891,7 @@ class SpeculativeSession:
         )
         start_ns = time.perf_counter_ns()
         prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = int(self.runtime_config.prefill_step_size)
+        prefill_step_size = self.prefill_step_size
         prefill_context_len = max(0, prompt_len - 1)
 
         for chunk_start in range(0, prefill_context_len, prefill_step_size):
@@ -902,6 +920,7 @@ class SpeculativeSession:
                 ),
             )
             del captured
+            self._raise_if_cancelled()
             yield PrefillProgressEvent(
                 tokens_processed=int(chunk_end),
                 tokens_total=int(prompt_len),
@@ -931,6 +950,7 @@ class SpeculativeSession:
             ),
         )
         del captured
+        self._raise_if_cancelled()
         yield PrefillProgressEvent(
             tokens_processed=int(prompt_len),
             tokens_total=int(prompt_len),
@@ -974,7 +994,6 @@ class SpeculativeSession:
         target_ops = self.target_ops
         target_model = self.target_model
         draft_model = self.draft_model
-        runtime_config = self.runtime_config
         snap_prefix_len = self.snap_prefix_len
         supports_prefix_snapshot = self.supports_prefix_snapshot
         supports_chunked_prefill = self.supports_chunked_prefill
@@ -1031,7 +1050,7 @@ class SpeculativeSession:
             yield evt
             yield_pause.done(_pre_yield)
         prefill_start_ns = time.perf_counter_ns()
-        prefill_step_size = int(runtime_config.prefill_step_size)
+        prefill_step_size = self.prefill_step_size
 
         _phase_rebuild_ns = 0
         _phase_cold_ns = 0
@@ -1123,6 +1142,7 @@ class SpeculativeSession:
             if profile_cycles:
                 _phase_cold_ns += time.perf_counter_ns() - _t
             self.clear_cache_boundary()
+            self._raise_if_cancelled()
             _pre_yield = yield_pause.mark()
             yield PrefillProgressEvent(
                 tokens_processed=int(chunk_end),
@@ -1181,6 +1201,7 @@ class SpeculativeSession:
             del feat, prefill_hidden_states
             if profile_cycles:
                 _phase_seam_ns += time.perf_counter_ns() - _t
+        self._raise_if_cancelled()
         _pre_yield = yield_pause.mark()
         yield PrefillProgressEvent(
             tokens_processed=int(snapshot_boundary),
@@ -1276,6 +1297,7 @@ class SpeculativeSession:
             if profile_cycles:
                 _phase_tail_ns += time.perf_counter_ns() - _t
             self.clear_cache_boundary()
+            self._raise_if_cancelled()
             _pre_yield = yield_pause.mark()
             yield PrefillProgressEvent(
                 tokens_processed=int(prompt_len),
@@ -1534,6 +1556,7 @@ class SpeculativeSession:
         next_decode_clear_at = decode_clear_interval
 
         while len(state.generated_token_ids) < max_new_tokens:
+            self._raise_if_cancelled()
             cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
             cycle_pause_start_ns = yield_pause.pause_ns if profile_cycles else 0
             cycle_prefix_len = int(state.start)
@@ -2193,6 +2216,7 @@ class SpeculativeSession:
             state.generated_token_ids.append(int(state.staged_first.item()))
         state.start = request.prompt_len
         while len(state.generated_token_ids) < max_new_tokens:
+            self._raise_if_cancelled()
             remaining = max_new_tokens - len(state.generated_token_ids)
             block_len = max(
                 1,
@@ -2552,6 +2576,7 @@ class SpeculativeSession:
         next_decode_clear_at = decode_clear_interval
 
         while len(state.generated_token_ids) < max_new_tokens:
+            self._raise_if_cancelled()
             track_cycle_wall = profile_cycles or adaptive_block_policy is not None
             cycle_start_ns = time.perf_counter_ns() if track_cycle_wall else 0
             cycle_pause_start_ns = yield_pause.pause_ns if track_cycle_wall else 0
@@ -3328,6 +3353,8 @@ def stream_dflash_generate_impl(
     prefix_cache_active: bool = False,
     publish_generation_snapshot: bool = True,
     prefix_hit_kind: str = "miss",
+    prefill_step_size: int | None = None,
+    should_cancel: Callable[[], bool] | None = None,
     runtime_context: Any,
 ) -> Iterator[EngineEvent]:
     target_capabilities = target_ops.capabilities_for(target_model)
@@ -3460,6 +3487,8 @@ def stream_dflash_generate_impl(
         quantize_kv_cache=quantize_kv_cache,
         target_fa_window=target_fa_window,
         runtime_context=runtime_context,
+        prefill_step_size=prefill_step_size,
+        should_cancel=should_cancel,
     )
     prefix_snapshot = None
     yield from session.run_events(request)

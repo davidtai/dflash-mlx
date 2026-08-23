@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from dflash_mlx.engine.exceptions import DFlashGenerationCancelled
 
 if TYPE_CHECKING:
     from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
@@ -16,9 +18,12 @@ if TYPE_CHECKING:
     from dflash_mlx.engine.target_ops import TargetOps
     from dflash_mlx.model import DFlashDraftModel
 
-__all__ = ["VerifyConfig", "get_stop_token_ids", "stream_dflash_generate"]
-
-
+__all__ = [
+    "DFlashGenerationCancelled",
+    "VerifyConfig",
+    "get_stop_token_ids",
+    "stream_dflash_generate",
+]
 def get_stop_token_ids(tokenizer: Any) -> list[int]:
     eos_token_ids = list(getattr(tokenizer, "eos_token_ids", None) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
@@ -62,6 +67,8 @@ def stream_dflash_generate(
     prefix_cache_active: bool = False,
     publish_generation_snapshot: bool = True,
     prefix_hit_kind: str = "miss",
+    prefill_step_size: int | None = None,
+    should_cancel: Callable[[], bool] | None = None,
     runtime_context: Any = None,
 ) -> Iterator[EngineEvent]:
     if runtime_context is None:
@@ -99,6 +106,8 @@ def stream_dflash_generate(
             prefix_cache_active=prefix_cache_active,
             publish_generation_snapshot=publish_generation_snapshot,
             prefix_hit_kind=prefix_hit_kind,
+            prefill_step_size=prefill_step_size,
+            should_cancel=should_cancel,
             runtime_context=runtime_context,
         )
         prefix_snapshot = None

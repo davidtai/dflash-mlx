@@ -28,6 +28,7 @@ from dflash_mlx.engine.events import (
 )
 from dflash_mlx.engine import spec_epoch
 from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
+from dflash_mlx.runtime import DFlashGenerationCancelled
 from dflash_mlx.runtime.config import runtime_config_from_defaults
 from dflash_mlx.runtime.context import build_runtime_context
 
@@ -2741,6 +2742,177 @@ def test_fixed_linear_prefill_settles_each_chunk_including_final_m1():
 
     assert target_ops.forward_lengths == [4, 4, 1, 1]
     assert target_ops.prefill_settlement_lengths == [4, 4, 1, 1]
+
+
+def test_fixed_linear_prefill_step_size_is_overridden_per_request():
+    runtime_context = _fixed_linear_runtime_context()
+    target_ops = _FixedLinearTargetOps()
+
+    list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=_FixedLinearDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(10)),
+            prefill_step_size=3,
+            runtime_context=runtime_context,
+        )
+    )
+
+    assert target_ops.forward_lengths == [3, 3, 3, 1]
+    assert target_ops.prefill_settlement_lengths == [3, 3, 3, 1]
+    assert runtime_context.runtime.prefill_step_size == 4
+
+
+def test_per_request_prefill_step_size_must_be_positive():
+    with pytest.raises(ValueError, match="prefill_step_size must be > 0"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=_FixedLinearTargetOps(),
+                tokenizer=object(),
+                draft_model=_draft_model(),
+                draft_backend=_FixedLinearDraftBackend(),
+                prompt="unused",
+                max_new_tokens=0,
+                prompt_tokens_override=[1, 2],
+                prefill_step_size=0,
+                runtime_context=_fixed_linear_runtime_context(),
+            )
+        )
+
+
+def test_fixed_linear_cancellation_raises_after_settled_prefill_chunk():
+    target_ops = _FixedLinearTargetOps()
+    draft_backend = _FixedLinearDraftBackend()
+    cancellation_checks = 0
+
+    def should_cancel():
+        nonlocal cancellation_checks
+        cancellation_checks += 1
+        return True
+
+    with pytest.raises(DFlashGenerationCancelled):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=_draft_model(),
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=4,
+                prompt_tokens_override=list(range(10)),
+                should_cancel=should_cancel,
+                runtime_context=_fixed_linear_runtime_context(),
+            )
+        )
+
+    assert cancellation_checks == 1
+    assert target_ops.forward_lengths == [4]
+    assert target_ops.prefill_settlement_lengths == [4]
+    assert target_ops.cleanup_calls == 1
+    assert draft_backend.calls == []
+
+
+def test_general_dflash_cancellation_raises_after_prefill_chunk():
+    target_ops = _FakeTargetOps()
+
+    with pytest.raises(DFlashGenerationCancelled):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=_draft_model(),
+                draft_backend=_FakeDraftBackend(),
+                prompt="unused",
+                max_new_tokens=4,
+                prompt_tokens_override=list(range(10)),
+                should_cancel=lambda: True,
+                runtime_context=_runtime_context(),
+            )
+        )
+
+    assert target_ops.forward_lengths == [4]
+    assert target_ops.cleanup_calls == 1
+
+
+def test_general_dflash_cancellation_is_observed_before_next_decode_cycle():
+    class _CycleCountingTargetOps(_FakeTargetOps):
+        def __init__(self):
+            super().__init__()
+            self.completed_cycles = 0
+
+        def restore_after_acceptance(self, *_args, **_kwargs):
+            self.completed_cycles += 1
+            return 0
+
+    target_ops = _CycleCountingTargetOps()
+
+    with pytest.raises(DFlashGenerationCancelled):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=_draft_model(),
+                draft_backend=_FakeDraftBackend(),
+                prompt="unused",
+                max_new_tokens=8,
+                prompt_tokens_override=[1, 2],
+                should_cancel=lambda: target_ops.completed_cycles == 1,
+                runtime_context=_runtime_context(),
+            )
+        )
+
+    assert target_ops.completed_cycles == 1
+    assert target_ops.cleanup_calls == 1
+
+
+def test_fixed_linear_cancellation_is_observed_before_next_decode_cycle():
+    target_ops = _FixedLinearTargetOps(
+        posterior_rows=((0, 0, 0, 0), (0, 0, 0, 0)),
+    )
+    draft_backend = _FixedLinearDraftBackend()
+    cancellation_checkpoints = []
+
+    def should_cancel():
+        cancellation_checkpoints.append(
+            (tuple(target_ops.forward_lengths), target_ops.verify_calls)
+        )
+        return target_ops.verify_calls == 1
+
+    with pytest.raises(DFlashGenerationCancelled):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=_draft_model(),
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=8,
+                prompt_tokens_override=[1, 2],
+                should_cancel=should_cancel,
+                runtime_context=_fixed_linear_runtime_context(),
+            )
+        )
+
+    assert cancellation_checkpoints == [
+        ((1,), 0),
+        ((1, 1), 0),
+        ((1, 1), 0),
+        ((1, 1), 1),
+    ]
+    assert target_ops.verify_calls == 1
+    assert target_ops.verify_settlement_lengths == [4]
+    assert target_ops.restore_calls == 1
+    assert target_ops.cleanup_calls == 1
 
 
 def test_fixed_linear_capability_keeps_physical_width_at_output_tail():
