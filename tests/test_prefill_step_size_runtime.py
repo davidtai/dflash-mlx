@@ -2983,6 +2983,167 @@ def test_fixed_linear_stop_segment_does_not_launch_next_draft():
     assert draft_backend.calls == [(4, True), (4, True)]
 
 
+def test_session_open_failure_cleans_acquired_target_and_draft_caches(monkeypatch):
+    target_cache = [object()]
+    draft_cache = [object()]
+    cleanup_calls = []
+    primary_error = RuntimeError("copy index construction failed")
+
+    class _OwnedCacheTargetOps(_FakeTargetOps):
+        def make_cache(self, *_args, **_kwargs):
+            return target_cache
+
+        def cleanup_generation_caches(self, acquired_target, acquired_draft):
+            cleanup_calls.append((acquired_target, acquired_draft))
+
+    class _OwnedCacheDraftBackend(_FakeDraftBackend):
+        def make_cache(self, **_kwargs):
+            return draft_cache
+
+    def fail_copy_index(_prompt_tokens):
+        raise primary_error
+
+    monkeypatch.setattr(spec_epoch, "CopySpecIndex", fail_copy_index)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        spec_epoch.SpeculativeSession.open(
+            target_model=object(),
+            target_ops=_OwnedCacheTargetOps(),
+            draft_model=_draft_model(),
+            draft_backend=_OwnedCacheDraftBackend(),
+            supports_prefix_snapshot=True,
+            supports_chunked_prefill=True,
+            allow_full_context_draft_layers=False,
+            prompt_tokens=[1, 2],
+            max_new_tokens=4,
+            prefix_snapshot=None,
+            quantize_kv_cache=False,
+            target_fa_window=0,
+            runtime_context=_runtime_context(),
+        )
+
+    assert exc_info.value is primary_error
+    assert cleanup_calls == [(target_cache, draft_cache)]
+
+
+def test_session_open_preserves_primary_error_when_cache_cleanup_fails(monkeypatch):
+    primary_error = RuntimeError("copy index construction failed")
+    cleanup_error = RuntimeError("cache cleanup failed")
+
+    class _CleanupFailingTargetOps(_FakeTargetOps):
+        def cleanup_generation_caches(self, _target_cache, _draft_cache):
+            raise cleanup_error
+
+    def fail_copy_index(_prompt_tokens):
+        raise primary_error
+
+    monkeypatch.setattr(spec_epoch, "CopySpecIndex", fail_copy_index)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        spec_epoch.SpeculativeSession.open(
+            target_model=object(),
+            target_ops=_CleanupFailingTargetOps(),
+            draft_model=_draft_model(),
+            draft_backend=_FakeDraftBackend(),
+            supports_prefix_snapshot=True,
+            supports_chunked_prefill=True,
+            allow_full_context_draft_layers=False,
+            prompt_tokens=[1, 2],
+            max_new_tokens=4,
+            prefix_snapshot=None,
+            quantize_kv_cache=False,
+            target_fa_window=0,
+            runtime_context=_runtime_context(),
+        )
+
+    assert exc_info.value is primary_error
+    assert getattr(exc_info.value, "__notes__", ()) == [
+        "SpeculativeSession.open cache cleanup also failed: "
+        "RuntimeError('cache cleanup failed')"
+    ]
+
+
+def test_session_open_hydrate_failure_cleans_acquired_target_cache(monkeypatch):
+    target_cache = [object()]
+    cleanup_calls = []
+
+    class _OwnedCacheTargetOps(_FakeTargetOps):
+        def make_cache(self, *_args, **_kwargs):
+            return target_cache
+
+        def cleanup_generation_caches(self, acquired_target, acquired_draft):
+            cleanup_calls.append((acquired_target, acquired_draft))
+
+    monkeypatch.setattr(spec_epoch, "_validate_prefix_snapshot", lambda *_args: 1)
+    monkeypatch.setattr(
+        spec_epoch,
+        "hydrate_target_cache",
+        lambda *_args: (_ for _ in ()).throw(ValueError("hydrate failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="prefix snapshot hydrate failed"):
+        spec_epoch.SpeculativeSession.open(
+            target_model=object(),
+            target_ops=_OwnedCacheTargetOps(),
+            draft_model=_draft_model(),
+            draft_backend=_FakeDraftBackend(),
+            supports_prefix_snapshot=True,
+            supports_chunked_prefill=True,
+            allow_full_context_draft_layers=False,
+            prompt_tokens=[1, 2],
+            max_new_tokens=4,
+            prefix_snapshot=object(),
+            quantize_kv_cache=False,
+            target_fa_window=0,
+            runtime_context=_runtime_context(),
+        )
+
+    assert cleanup_calls == [(target_cache, [])]
+
+
+def test_sparse_prefill_install_failure_closes_session(monkeypatch):
+    target_ops = _FakeTargetOps()
+    primary_error = RuntimeError("sparse rope install failed")
+    session = spec_epoch.SpeculativeSession.open(
+        target_model=object(),
+        target_ops=target_ops,
+        draft_model=_draft_model(),
+        draft_backend=_FakeDraftBackend(),
+        supports_prefix_snapshot=True,
+        supports_chunked_prefill=True,
+        allow_full_context_draft_layers=False,
+        prompt_tokens=[1, 2],
+        max_new_tokens=4,
+        prefix_snapshot=None,
+        quantize_kv_cache=False,
+        target_fa_window=0,
+        runtime_context=_runtime_context(),
+    )
+    request = spec_epoch._SessionRequest.from_tokens(
+        prompt_tokens=[1, 2],
+        max_new_tokens=4,
+        block_tokens=None,
+        stop_token_ids=None,
+        suppress_token_ids=None,
+        prefix_snapshot=None,
+        snapshot_service=None,
+        stable_prefix_len=None,
+        prefix_cache_active=False,
+        prompt_token_positions=[0, 1],
+    )
+
+    def fail_install(_request):
+        raise primary_error
+
+    monkeypatch.setattr(session, "_install_sparse_prefill_rope", fail_install)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        next(session.run_events(request))
+
+    assert exc_info.value is primary_error
+    assert target_ops.cleanup_calls == 1
+
+
 def test_stream_close_cleans_session_caches():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()

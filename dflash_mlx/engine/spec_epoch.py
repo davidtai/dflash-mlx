@@ -745,90 +745,107 @@ class SpeculativeSession:
             and not snapshot_covers_prefix(prefix_snapshot, snap_prefix_len)
         ):
             snap_prefix_len = 0
-        if snap_prefix_len > 0:
-            template_cache = target_ops.make_cache(
-                target_model,
-                enable_speculative_linear_cache=True,
-                quantize_kv_cache=quantize_kv_cache,
-                target_fa_window=target_fa_window,
-                cache_capacity_tokens=len(prompt_tokens)
-                + max(0, int(max_new_tokens)),
-            )
-            try:
-                assert prefix_snapshot is not None
-                target_cache = hydrate_target_cache(prefix_snapshot, template_cache)
-            except (ValueError, TypeError) as exc:
-                raise RuntimeError(
-                    f"prefix snapshot hydrate failed for {snap_prefix_len} tokens"
-                ) from exc
-            finally:
-                del template_cache
-        else:
-            target_cache = target_ops.make_cache(
-                target_model,
-                enable_speculative_linear_cache=True,
-                quantize_kv_cache=quantize_kv_cache,
-                target_fa_window=target_fa_window,
-                cache_capacity_tokens=len(prompt_tokens)
-                + max(0, int(max_new_tokens)),
-            )
-        draft_cache = draft_backend.make_cache(
-            draft_model=draft_model,
-            sink_size=draft_sink_size,
-            window_size=draft_window_size,
-            allow_full_context_layers=allow_full_context_draft_layers,
-        )
-        capture_logits = (
-            False
-            if fixed_linear_runtime
-            else os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
-        )
-        copyspec_mode = str(getattr(runtime_config, "copyspec_mode", "conservative"))
-        if not _draft_capability(draft_model, "supports_copyspec", default=True):
-            copyspec_mode = "off"
-        copyspec_index = (
-            DisabledCopySpecIndex()
-            if copyspec_mode == "off"
-            else CopySpecIndex(prompt_tokens)
-        )
-        return cls(
-            target_model=target_model,
-            draft_model=draft_model,
-            target_ops=target_ops,
-            target_cache=target_cache,
-            draft_cache=draft_cache,
-            draft_backend=draft_backend,
-            capture_logits=capture_logits,
-            runtime_config=runtime_config,
-            quantize_kv_cache=bool(quantize_kv_cache),
-            snap_prefix_len=snap_prefix_len,
-            supports_prefix_snapshot=supports_prefix_snapshot,
-            supports_chunked_prefill=supports_chunked_prefill,
-            allow_full_context_draft_layers=allow_full_context_draft_layers,
-            draft_sink_size=draft_sink_size,
-            draft_window_size=draft_window_size,
-            target_layer_id_list=list(draft_model.target_layer_ids),
-            capture_layer_ids={
-                int(layer_id) + 1 for layer_id in draft_model.target_layer_ids
-            },
-            profile_cycles=profile_cycles,
-            memory_waterfall=memory_waterfall,
-            clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
+        draft_cache: list[Any] = []
+        target_cache = target_ops.make_cache(
+            target_model,
+            enable_speculative_linear_cache=True,
+            quantize_kv_cache=quantize_kv_cache,
             target_fa_window=target_fa_window,
-            copyspec_index=copyspec_index,
-            copyspec_mode=copyspec_mode,
-            fixed_linear_runtime=bool(fixed_linear_runtime),
-            fixed_physical_block=bool(
-                fixed_linear_runtime
-                and _draft_capability(
-                    draft_model,
-                    "fixed_physical_block",
-                    default=False,
-                )
-            ),
-            prefill_step_size=resolved_prefill_step_size,
-            should_cancel=should_cancel,
+            cache_capacity_tokens=len(prompt_tokens) + max(0, int(max_new_tokens)),
         )
+        try:
+            if snap_prefix_len > 0:
+                template_cache = target_cache
+                try:
+                    assert prefix_snapshot is not None
+                    hydrated_target_cache = hydrate_target_cache(
+                        prefix_snapshot,
+                        template_cache,
+                    )
+                except (ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        "prefix snapshot hydrate failed for "
+                        f"{snap_prefix_len} tokens"
+                    ) from exc
+                else:
+                    target_cache = hydrated_target_cache
+                finally:
+                    del template_cache
+            draft_cache = draft_backend.make_cache(
+                draft_model=draft_model,
+                sink_size=draft_sink_size,
+                window_size=draft_window_size,
+                allow_full_context_layers=allow_full_context_draft_layers,
+            )
+            capture_logits = (
+                False
+                if fixed_linear_runtime
+                else os.environ.get("DFLASH_CAPTURE_LOGITS", "") == "1"
+            )
+            copyspec_mode = str(
+                getattr(runtime_config, "copyspec_mode", "conservative")
+            )
+            if not _draft_capability(draft_model, "supports_copyspec", default=True):
+                copyspec_mode = "off"
+            copyspec_index = (
+                DisabledCopySpecIndex()
+                if copyspec_mode == "off"
+                else CopySpecIndex(prompt_tokens)
+            )
+            return cls(
+                target_model=target_model,
+                draft_model=draft_model,
+                target_ops=target_ops,
+                target_cache=target_cache,
+                draft_cache=draft_cache,
+                draft_backend=draft_backend,
+                capture_logits=capture_logits,
+                runtime_config=runtime_config,
+                quantize_kv_cache=bool(quantize_kv_cache),
+                snap_prefix_len=snap_prefix_len,
+                supports_prefix_snapshot=supports_prefix_snapshot,
+                supports_chunked_prefill=supports_chunked_prefill,
+                allow_full_context_draft_layers=allow_full_context_draft_layers,
+                draft_sink_size=draft_sink_size,
+                draft_window_size=draft_window_size,
+                target_layer_id_list=list(draft_model.target_layer_ids),
+                capture_layer_ids={
+                    int(layer_id) + 1 for layer_id in draft_model.target_layer_ids
+                },
+                profile_cycles=profile_cycles,
+                memory_waterfall=memory_waterfall,
+                clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
+                target_fa_window=target_fa_window,
+                copyspec_index=copyspec_index,
+                copyspec_mode=copyspec_mode,
+                fixed_linear_runtime=bool(fixed_linear_runtime),
+                fixed_physical_block=bool(
+                    fixed_linear_runtime
+                    and _draft_capability(
+                        draft_model,
+                        "fixed_physical_block",
+                        default=False,
+                    )
+                ),
+                prefill_step_size=resolved_prefill_step_size,
+                should_cancel=should_cancel,
+            )
+        except BaseException as primary_error:
+            try:
+                target_ops.cleanup_generation_caches(target_cache, draft_cache)
+            except BaseException as cleanup_error:
+                note = (
+                    "SpeculativeSession.open cache cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+                add_note = getattr(primary_error, "add_note", None)
+                if callable(add_note):
+                    add_note(note)
+                else:
+                    notes = list(getattr(primary_error, "__notes__", ()))
+                    notes.append(note)
+                    setattr(primary_error, "__notes__", notes)
+            raise
 
     def _raise_if_cancelled(self) -> None:
         if self.should_cancel is not None and self.should_cancel():
@@ -3089,13 +3106,10 @@ class SpeculativeSession:
         yield_pause = _YieldPauseTracker(enabled=bool(profile_cycles or memory_waterfall))
         state = _RequestState()
 
-        sparse_rope_saved = (
-            None
-            if self.fixed_linear_runtime
-            else self._install_sparse_prefill_rope(request)
-        )
-
+        sparse_rope_saved = None
         try:
+            if not self.fixed_linear_runtime:
+                sparse_rope_saved = self._install_sparse_prefill_rope(request)
             if self.fixed_linear_runtime:
                 prefill = yield from self._run_fixed_linear_prefill_events(
                     request=request,
