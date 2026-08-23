@@ -3144,6 +3144,153 @@ def test_sparse_prefill_install_failure_closes_session(monkeypatch):
     assert target_ops.cleanup_calls == 1
 
 
+def test_run_events_cleanup_failures_do_not_mask_cancellation(monkeypatch):
+    cleanup_calls = []
+    cancellation_error = DFlashGenerationCancelled("request cancelled")
+    restore_error = RuntimeError("rope restore failed")
+    clear_error = RuntimeError("sparse position clear failed")
+    close_error = RuntimeError("arena release failed")
+    text_model = object()
+
+    class _CleanupFailingTargetOps(_FakeTargetOps):
+        def text_model(self, _target_model):
+            return text_model
+
+        def cleanup_generation_caches(self, _target_cache, _draft_cache):
+            cleanup_calls.append("close")
+            raise close_error
+
+    target_ops = _CleanupFailingTargetOps()
+    session = spec_epoch.SpeculativeSession.open(
+        target_model=object(),
+        target_ops=target_ops,
+        draft_model=_draft_model(),
+        draft_backend=_FakeDraftBackend(),
+        supports_prefix_snapshot=True,
+        supports_chunked_prefill=True,
+        allow_full_context_draft_layers=False,
+        prompt_tokens=[1, 2],
+        max_new_tokens=4,
+        prefix_snapshot=None,
+        quantize_kv_cache=False,
+        target_fa_window=0,
+        runtime_context=_runtime_context(),
+    )
+    request = spec_epoch._SessionRequest.from_tokens(
+        prompt_tokens=[1, 2],
+        max_new_tokens=4,
+        block_tokens=None,
+        stop_token_ids=None,
+        suppress_token_ids=None,
+        prefix_snapshot=None,
+        snapshot_service=None,
+        stable_prefix_len=None,
+        prefix_cache_active=False,
+        prompt_token_positions=[0, 1],
+    )
+
+    def fail_prefill(**_kwargs):
+        raise cancellation_error
+        yield
+
+    def fail_restore(_saved):
+        cleanup_calls.append("restore")
+        raise restore_error
+
+    def fail_clear(acquired_text_model):
+        assert acquired_text_model is text_model
+        cleanup_calls.append("clear")
+        raise clear_error
+
+    monkeypatch.setattr(session, "_install_sparse_prefill_rope", lambda _request: [])
+    monkeypatch.setattr(session, "_run_prefill_events", fail_prefill)
+    monkeypatch.setattr(spec_epoch, "restore_ropes", fail_restore)
+    monkeypatch.setattr(spec_epoch, "clear_sparse_positions", fail_clear)
+
+    with pytest.raises(DFlashGenerationCancelled) as exc_info:
+        next(session.run_events(request))
+
+    assert exc_info.value is cancellation_error
+    assert cleanup_calls == ["restore", "clear", "close"]
+    assert getattr(cancellation_error, "__notes__", ()) == [
+        "SpeculativeSession.run_events sparse RoPE restore failed: "
+        "RuntimeError('rope restore failed')",
+        "SpeculativeSession.run_events sparse position clear failed: "
+        "RuntimeError('sparse position clear failed')",
+        "SpeculativeSession.run_events session close failed: "
+        "RuntimeError('arena release failed')",
+    ]
+
+
+def test_run_events_normal_completion_raises_first_cleanup_failure(monkeypatch):
+    cleanup_calls = []
+    restore_error = RuntimeError("rope restore failed")
+    clear_error = RuntimeError("sparse position clear failed")
+    close_error = RuntimeError("arena release failed")
+    text_model = object()
+
+    class _CleanupFailingTargetOps(_FakeTargetOps):
+        def text_model(self, _target_model):
+            return text_model
+
+        def cleanup_generation_caches(self, _target_cache, _draft_cache):
+            cleanup_calls.append("close")
+            raise close_error
+
+    session = spec_epoch.SpeculativeSession.open(
+        target_model=object(),
+        target_ops=_CleanupFailingTargetOps(),
+        draft_model=_draft_model(),
+        draft_backend=_FakeDraftBackend(),
+        supports_prefix_snapshot=True,
+        supports_chunked_prefill=True,
+        allow_full_context_draft_layers=False,
+        prompt_tokens=[1, 2],
+        max_new_tokens=0,
+        prefix_snapshot=None,
+        quantize_kv_cache=False,
+        target_fa_window=0,
+        runtime_context=_runtime_context(),
+    )
+    request = spec_epoch._SessionRequest.from_tokens(
+        prompt_tokens=[1, 2],
+        max_new_tokens=0,
+        block_tokens=None,
+        stop_token_ids=None,
+        suppress_token_ids=None,
+        prefix_snapshot=None,
+        snapshot_service=None,
+        stable_prefix_len=None,
+        prefix_cache_active=False,
+        prompt_token_positions=[0, 1],
+    )
+
+    def fail_restore(_saved):
+        cleanup_calls.append("restore")
+        raise restore_error
+
+    def fail_clear(acquired_text_model):
+        assert acquired_text_model is text_model
+        cleanup_calls.append("clear")
+        raise clear_error
+
+    monkeypatch.setattr(session, "_install_sparse_prefill_rope", lambda _request: [])
+    monkeypatch.setattr(spec_epoch, "restore_ropes", fail_restore)
+    monkeypatch.setattr(spec_epoch, "clear_sparse_positions", fail_clear)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        list(session.run_events(request))
+
+    assert exc_info.value is restore_error
+    assert cleanup_calls == ["restore", "clear", "close"]
+    assert getattr(restore_error, "__notes__", ()) == [
+        "SpeculativeSession.run_events sparse position clear failed: "
+        "RuntimeError('sparse position clear failed')",
+        "SpeculativeSession.run_events session close failed: "
+        "RuntimeError('arena release failed')",
+    ]
+
+
 def test_stream_close_cleans_session_caches():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()

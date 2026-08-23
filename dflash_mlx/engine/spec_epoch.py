@@ -632,6 +632,16 @@ def _validate_draft_runtime_compatibility(
         raise ValueError("draft model does not support --verify-mode ddtree")
 
 
+def _add_exception_note(error: BaseException, note: str) -> None:
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = list(getattr(error, "__notes__", ()))
+    notes.append(note)
+    setattr(error, "__notes__", notes)
+
+
 @dataclass
 class SpeculativeSession:
     target_model: Any
@@ -838,13 +848,7 @@ class SpeculativeSession:
                     "SpeculativeSession.open cache cleanup also failed: "
                     f"{cleanup_error!r}"
                 )
-                add_note = getattr(primary_error, "add_note", None)
-                if callable(add_note):
-                    add_note(note)
-                else:
-                    notes = list(getattr(primary_error, "__notes__", ()))
-                    notes.append(note)
-                    setattr(primary_error, "__notes__", notes)
+                _add_exception_note(primary_error, note)
             raise
 
     def _raise_if_cancelled(self) -> None:
@@ -3107,6 +3111,7 @@ class SpeculativeSession:
         state = _RequestState()
 
         sparse_rope_saved = None
+        primary_error: BaseException | None = None
         try:
             if not self.fixed_linear_runtime:
                 sparse_rope_saved = self._install_sparse_prefill_rope(request)
@@ -3219,13 +3224,41 @@ class SpeculativeSession:
                 hit_kind=request.prefix_hit_kind,
             )
             yield summary
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
+            cleanup_failures: list[tuple[str, BaseException]] = []
             if sparse_rope_saved is not None:
-                restore_ropes(sparse_rope_saved)
-                clear_sparse_positions(
-                    self.target_ops.text_model(self.target_model)
-                )
-            self.close()
+                try:
+                    restore_ropes(sparse_rope_saved)
+                except BaseException as error:
+                    cleanup_failures.append(("sparse RoPE restore", error))
+                try:
+                    clear_sparse_positions(
+                        self.target_ops.text_model(self.target_model)
+                    )
+                except BaseException as error:
+                    cleanup_failures.append(("sparse position clear", error))
+            try:
+                self.close()
+            except BaseException as error:
+                cleanup_failures.append(("session close", error))
+
+            if cleanup_failures:
+                if primary_error is not None:
+                    note_target = primary_error
+                    later_failures = cleanup_failures
+                else:
+                    _first_stage, note_target = cleanup_failures[0]
+                    later_failures = cleanup_failures[1:]
+                for stage, error in later_failures:
+                    _add_exception_note(
+                        note_target,
+                        f"SpeculativeSession.run_events {stage} failed: {error!r}",
+                    )
+                if primary_error is None:
+                    raise note_target
 
     def _install_sparse_prefill_rope(
         self, request: _SessionRequest
