@@ -1,4 +1,43 @@
-from dflash_mlx.engine.spec_epoch import _AdaptiveBlockPolicy
+from types import SimpleNamespace
+
+from dflash_mlx.engine.spec_epoch import (
+    _AdaptiveBlockPolicy,
+    _resolve_adaptive_block_policy,
+)
+
+
+def test_external_adaptive_policy_factory_overrides_stock_policy() -> None:
+    expected = SimpleNamespace(
+        block_limit=lambda: 3,
+        record=lambda **_kwargs: None,
+        reductions=0,
+        reduced_cycles=0,
+        min_seen=1,
+        metrics=lambda: {"kind": "external"},
+    )
+    calls = []
+    target_model = SimpleNamespace(
+        _dflash_adaptive_block_policy_factory=lambda **kwargs: calls.append(kwargs)
+        or expected
+    )
+    runtime_config = SimpleNamespace(verify_mode="dflash")
+
+    policy = _resolve_adaptive_block_policy(
+        target_model=target_model,
+        runtime_config=runtime_config,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=16_384,
+    )
+
+    assert policy is expected
+    assert calls == [
+        {
+            "full_block_tokens": 8,
+            "verify_len_cap": 8,
+            "prompt_len": 16_384,
+        }
+    ]
 
 
 def test_adaptive_m4_full_accept_uses_draft_capacity() -> None:

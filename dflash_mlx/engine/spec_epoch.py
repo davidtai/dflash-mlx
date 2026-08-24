@@ -605,6 +605,51 @@ class _AdaptiveBlockPolicy:
             self._enter_reduced()
 
 
+def _resolve_adaptive_block_policy(
+    *,
+    target_model: Any,
+    runtime_config: Any,
+    effective_block_tokens: int,
+    verify_len_cap: int,
+    prompt_len: int,
+) -> Any | None:
+    """Resolve an optional model-owned policy before the stock DFlash policy.
+
+    A target integration may attach a per-request factory when its adaptive
+    schedule is part of the model contract. The returned object deliberately
+    uses the same small interface as ``_AdaptiveBlockPolicy`` so the decode
+    loop stays independent of the policy implementation.
+    """
+
+    factory = getattr(target_model, "_dflash_adaptive_block_policy_factory", None)
+    if factory is None:
+        return _AdaptiveBlockPolicy.from_runtime(
+            runtime_config=runtime_config,
+            effective_block_tokens=effective_block_tokens,
+            verify_len_cap=verify_len_cap,
+            prompt_len=prompt_len,
+        )
+    policy = factory(
+        full_block_tokens=int(effective_block_tokens),
+        verify_len_cap=int(verify_len_cap),
+        prompt_len=int(prompt_len),
+    )
+    required = (
+        "block_limit",
+        "record",
+        "metrics",
+        "reductions",
+        "reduced_cycles",
+        "min_seen",
+    )
+    missing = [name for name in required if not hasattr(policy, name)]
+    if missing:
+        raise TypeError(
+            "external DFlash adaptive policy is missing: " + ", ".join(missing)
+        )
+    return policy
+
+
 def _capture_rows_int(arr: mx.array) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(int(t) for t in row) for row in arr.tolist())
 
@@ -2505,7 +2550,8 @@ class SpeculativeSession:
             block_tokens,
         )
         effective_block_tokens = cycle_config.effective_block_tokens
-        adaptive_block_policy = _AdaptiveBlockPolicy.from_runtime(
+        adaptive_block_policy = _resolve_adaptive_block_policy(
+            target_model=target_model,
             runtime_config=runtime_config,
             effective_block_tokens=effective_block_tokens,
             verify_len_cap=cycle_config.verify_len_cap,
@@ -2881,7 +2927,8 @@ class SpeculativeSession:
                         copyspec_auto_gate.take_reset()
                         and adaptive_block_policy is not None
                     ):
-                        adaptive_block_policy = _AdaptiveBlockPolicy.from_runtime(
+                        adaptive_block_policy = _resolve_adaptive_block_policy(
+                            target_model=target_model,
                             runtime_config=runtime_config,
                             effective_block_tokens=effective_block_tokens,
                             verify_len_cap=cycle_config.verify_len_cap,
