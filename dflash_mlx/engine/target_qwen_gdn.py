@@ -33,13 +33,6 @@ _TREE_PARENT_IDS_ATTR = "_dflash_tree_parent_ids"
 _TREE_ATTENTION_MASK_ATTR = "_dflash_tree_attention_mask"
 _TREE_PREFIX_LEN_ATTR = "_dflash_tree_prefix_len"
 _TREE_SIZE_ATTR = "_dflash_tree_size"
-_DFLASH_QWEN_TARGET_COUNTERS = {
-    "gdn_decay_memo_calls": 0,
-}
-
-
-def dflash_qwen_target_counter_snapshot() -> dict[str, int]:
-    return dict(_DFLASH_QWEN_TARGET_COUNTERS)
 
 
 class DFlashTargetKVCache(cache_mod.KVCache):
@@ -329,18 +322,6 @@ def _linear_attn_projections(
     return qkv, z, b, a
 
 
-def _linear_decay(linear_attn: Any, a: mx.array) -> mx.array:
-    memo = getattr(linear_attn, "_mtplx_qwen38_neg_exp_a_log", None)
-    if memo is None:
-        return gated_delta_mod.compute_g(
-            linear_attn.A_log,
-            a,
-            linear_attn.dt_bias,
-        )
-    _DFLASH_QWEN_TARGET_COUNTERS["gdn_decay_memo_calls"] += 1
-    return mx.exp(memo * nn.softplus(a + linear_attn.dt_bias))
-
-
 def _tree_recurrent_call(
     linear_attn: Any,
     inputs: mx.array,
@@ -373,7 +354,7 @@ def _tree_recurrent_call(
     inv_scale = k.shape[-1] ** -0.5
     q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
     k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-    g = _linear_decay(linear_attn, a)
+    g = gated_delta_mod.compute_g(linear_attn.A_log, a, linear_attn.dt_bias)
     beta = mx.sigmoid(b)
 
     if state is None:
@@ -629,7 +610,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-        g = _linear_decay(self, a)
+        g = gated_delta_mod.compute_g(self.A_log, a, self.dt_bias)
         beta = mx.sigmoid(b)
 
         if state is None:

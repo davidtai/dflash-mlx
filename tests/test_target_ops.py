@@ -221,34 +221,6 @@ def _assert_close(actual, expected, *, atol: float = 1e-6) -> None:
     mx.eval(actual, expected)
     assert float(mx.max(mx.abs(actual - expected)).item()) <= atol
 
-
-def test_qwen_gdn_decay_uses_precomputed_negative_exp_when_present(monkeypatch):
-    a_log = mx.array([0.25, -0.5], dtype=mx.float32)
-    dt_bias = mx.array([0.1, -0.2], dtype=mx.float32)
-    linear_attn = SimpleNamespace(
-        A_log=a_log,
-        dt_bias=dt_bias,
-        _mtplx_qwen38_neg_exp_a_log=-mx.exp(a_log),
-    )
-    a = mx.array([[[[0.2, -0.3]]]], dtype=mx.float32)
-
-    def fail_compute_g(*_args, **_kwargs):
-        raise AssertionError("memoized DFlash target path called stock compute_g")
-
-    monkeypatch.setattr(qwen_gdn.gated_delta_mod, "compute_g", fail_compute_g)
-
-    before = qwen_gdn.dflash_qwen_target_counter_snapshot()
-    actual = qwen_gdn._linear_decay(linear_attn, a)
-    after = qwen_gdn.dflash_qwen_target_counter_snapshot()
-    expected = mx.exp(
-        linear_attn._mtplx_qwen38_neg_exp_a_log
-        * mx.logaddexp(a + dt_bias, mx.zeros_like(a))
-    )
-
-    _assert_close(actual, expected)
-    assert after["gdn_decay_memo_calls"] == before["gdn_decay_memo_calls"] + 1
-
-
 def test_resolver_selects_qwen_ops_for_current_target_shape():
     ops = resolve_target_ops(_FakeTarget())
 
