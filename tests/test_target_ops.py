@@ -336,6 +336,37 @@ def test_qwen_verify_gqa_route_is_internal_default(monkeypatch):
     assert attn.original_calls == 0
 
 
+def test_qwen_verify_gqa_route_accepts_target_qk_prepare_callback(monkeypatch):
+    attn, cache = _fake_qwen_full_attention(q_heads=24, kv_heads=4)
+    qk_calls: list[tuple[tuple[int, ...], tuple[int, ...], int]] = []
+    gqa_calls: list[tuple[int, int, int]] = []
+
+    def _prepare(queries, keys, offset):
+        qk_calls.append((tuple(queries.shape), tuple(keys.shape), int(offset)))
+        return (
+            queries.transpose(0, 2, 1, 3),
+            keys.transpose(0, 2, 1, 3),
+        )
+
+    def _fake_gqa(queries, keys, values, *, cache, scale, mask):
+        del values, cache, scale, mask
+        gqa_calls.append(
+            (int(queries.shape[2]), int(keys.shape[2]), int(queries.shape[-1]))
+        )
+        return mx.ones(queries.shape, dtype=queries.dtype)
+
+    attn._dflash_qk_prepare = _prepare
+    qwen_gdn._install_full_attention_gqa_hook(attn)
+    monkeypatch.setattr(qwen_gdn, "_gqa_reshape_sdpa", _fake_gqa)
+
+    out = attn(mx.zeros((1, 8, 32), dtype=mx.bfloat16), mask="causal", cache=cache)
+    mx.eval(out)
+
+    assert qk_calls == [((1, 8, 24, 256), (1, 8, 4, 256), 4096)]
+    assert gqa_calls == [(8, 8, 256)]
+    assert attn.original_calls == 0
+
+
 def test_qwen_dflash2_block5_uses_native_gqa_at_long_kv(monkeypatch):
     routes: list[str] = []
 

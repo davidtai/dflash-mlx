@@ -712,10 +712,13 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         keys = self.k_proj(x)
         values = self.v_proj(x)
 
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(B, L, num_key_value_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
+        keys = keys.reshape(B, L, num_key_value_heads, -1)
+        qk_prepare = getattr(self, "_dflash_qk_prepare", None)
+        if qk_prepare is None:
+            queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+            keys = self.k_norm(keys).transpose(0, 2, 1, 3)
+        else:
+            queries, keys = qk_prepare(queries, keys, cached_prefix_len)
         values = values.reshape(B, L, num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
@@ -727,8 +730,9 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         if not can_use_gqa_fast_path:
             return original_call(self, x, mask=mask, cache=cache)
 
-        queries = self.rope(queries, offset=cached_prefix_len)
-        keys = self.rope(keys, offset=cached_prefix_len)
+        if qk_prepare is None:
+            queries = self.rope(queries, offset=cached_prefix_len)
+            keys = self.rope(keys, offset=cached_prefix_len)
         keys, values = cache.update_and_fetch(keys, values)
         output = _gqa_reshape_sdpa(
             queries,
