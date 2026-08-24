@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from dflash_mlx.engine.spec_epoch import (
     _AdaptiveBlockPolicy,
+    _record_adaptive_block_policy,
     _resolve_adaptive_block_policy,
 )
 
@@ -36,6 +37,31 @@ def test_external_adaptive_policy_factory_overrides_stock_policy() -> None:
             "full_block_tokens": 8,
             "verify_len_cap": 8,
             "prompt_len": 16_384,
+        }
+    ]
+
+
+def test_external_adaptive_policy_receives_draft_top2_logprobs() -> None:
+    calls = []
+    policy = SimpleNamespace(
+        wants_draft_top2=True,
+        record=lambda **kwargs: calls.append(kwargs),
+    )
+
+    _record_adaptive_block_policy(
+        policy,
+        block_len=5,
+        acceptance_len=3,
+        cycle_cost_ns=123,
+        draft_top2_logprobs=((0.7, 0.2), (0.6, 0.1)),
+    )
+
+    assert calls == [
+        {
+            "block_len": 5,
+            "acceptance_len": 3,
+            "cycle_cost_ns": 123,
+            "draft_top2_logprobs": ((0.7, 0.2), (0.6, 0.1)),
         }
     ]
 

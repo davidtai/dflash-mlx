@@ -650,6 +650,24 @@ def _resolve_adaptive_block_policy(
     return policy
 
 
+def _record_adaptive_block_policy(
+    policy: Any,
+    *,
+    block_len: int,
+    acceptance_len: int,
+    cycle_cost_ns: int,
+    draft_top2_logprobs: tuple[tuple[float, ...], ...] | None,
+) -> None:
+    kwargs: dict[str, Any] = {
+        "block_len": int(block_len),
+        "acceptance_len": int(acceptance_len),
+        "cycle_cost_ns": int(cycle_cost_ns),
+    }
+    if bool(getattr(policy, "wants_draft_top2", False)):
+        kwargs["draft_top2_logprobs"] = draft_top2_logprobs or ()
+    policy.record(**kwargs)
+
+
 def _capture_rows_int(arr: mx.array) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(int(t) for t in row) for row in arr.tolist())
 
@@ -2557,6 +2575,10 @@ class SpeculativeSession:
             verify_len_cap=cycle_config.verify_len_cap,
             prompt_len=request.prompt_len,
         )
+        capture_draft_top2 = bool(
+            adaptive_block_policy is not None
+            and getattr(adaptive_block_policy, "wants_draft_top2", False)
+        )
         # copyspec_mode=auto: a self-gating policy that periodically A/B-probes
         # copyspec-on vs -off throughput, latches on/off, and signals an
         # adaptive-policy reset on disengage (so copyspec perturbation is
@@ -2682,7 +2704,7 @@ class SpeculativeSession:
             posterior_top2_logprobs_arr = None
 
             if block_len > 1:
-                if profile_cycles:
+                if profile_cycles or capture_draft_top2:
                     draft_start_ns = time.perf_counter_ns()
                     drafted = _copy_draft_for_block(
                         current_staged_first,
@@ -2692,7 +2714,7 @@ class SpeculativeSession:
                     if drafted is not None:
                         draft_source = "copyspec"
                         copyspec_tokens = int(drafted.shape[0])
-                    elif capture_logits:
+                    elif capture_logits or capture_draft_top2:
                         drafted, draft_topk_ids_arr, draft_topk_logprobs_arr = (
                             draft_backend.draft_greedy_capture(
                                 target_model=target_model,
@@ -2935,14 +2957,20 @@ class SpeculativeSession:
                             prompt_len=request.prompt_len,
                         )
                 if adaptive_block_policy is not None:
-                    adaptive_block_policy.record(
+                    _record_adaptive_block_policy(
+                        adaptive_block_policy,
                         block_len=block_len,
                         acceptance_len=acceptance_len,
                         cycle_cost_ns=adaptive_cycle_cost_ns,
+                        draft_top2_logprobs=(
+                            _capture_rows_float(draft_topk_logprobs_arr)[:2]
+                            if draft_topk_logprobs_arr is not None
+                            else None
+                        ),
                     )
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             self.copyspec_index.append_committed(committed_ids)
-            if not profile_cycles:
+            if not profile_cycles and not capture_draft_top2:
                 next_remaining = max_new_tokens - len(state.generated_token_ids) - commit_count
                 next_block_limit = (
                     adaptive_block_policy.block_limit()
