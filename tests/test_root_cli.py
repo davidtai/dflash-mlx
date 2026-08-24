@@ -4,7 +4,20 @@
 
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 from dflash_mlx import cli
+
+
+def test_pyproject_mlx_dependency_floor_matches_supported_runtime():
+    project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(project_file.read_text())
+    dependencies = set(data["project"]["dependencies"])
+
+    assert "mlx>=0.32.0" in dependencies
+    assert "mlx-lm>=0.31.3" in dependencies
+
 
 def test_models_command_lists_draft_registry(capsys):
     assert cli.run(["models"]) == 0
