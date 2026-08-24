@@ -127,6 +127,38 @@ def test_qwen_hidden_capture_calls_configured_post_layer_hook():
     assert calls == [((1, 3, 16), 0), ((1, 3, 16), 1)]
 
 
+def test_qwen_hidden_capture_accepts_cross_layer_boundary_fusion():
+    model = _tiny_qwen3_model()
+    ops = QwenGdnTargetOps()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.uint32)
+    expected_logits, expected_captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=prompt,
+    )
+    begin_calls = []
+    fused_calls = []
+
+    def fused_add_rmsnorm(base, delta, weight, eps, *, merged_boundary):
+        fused_calls.append(bool(merged_boundary))
+        hidden = base + delta
+        return hidden, mx.fast.rms_norm(hidden, weight, eps)
+
+    model.model._dflash_boundary_begin = lambda: begin_calls.append(1)
+    model.model._dflash_fused_add_rmsnorm = fused_add_rmsnorm
+    actual_logits, actual_captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=prompt,
+    )
+    mx.eval(expected_logits, actual_logits, *expected_captured, *actual_captured)
+
+    _assert_close(actual_logits, expected_logits)
+    assert len(actual_captured) == len(expected_captured)
+    for actual, expected in zip(actual_captured, expected_captured, strict=True):
+        _assert_close(actual, expected)
+    assert begin_calls == [1]
+    assert fused_calls == [False, True, False]
+
+
 def test_qwen_tree_verify_matches_sequential_path_logits():
     model = _tiny_qwen3_model()
     ops = QwenGdnTargetOps()

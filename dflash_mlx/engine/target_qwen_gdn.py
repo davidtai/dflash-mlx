@@ -889,31 +889,63 @@ class QwenGdnTargetOps:
             captured = {0: hidden_states} if 0 in capture_layer_ids else {}
         h = hidden_states
         post_layer = getattr(inner, "_dflash_post_layer", None)
+        fused_add_rmsnorm = getattr(inner, "_dflash_fused_add_rmsnorm", None)
+        boundary_base = hidden_states
+        boundary_delta = None
+        if fused_add_rmsnorm is not None:
+            boundary_begin = getattr(inner, "_dflash_boundary_begin", None)
+            if boundary_begin is not None:
+                boundary_begin()
 
-        if hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx"):
+        def advance_layer(layer: Any, layer_cache: Any, mask: Any) -> mx.array:
+            nonlocal boundary_base, boundary_delta
+            if fused_add_rmsnorm is None:
+                return layer(h, mask=mask, cache=layer_cache)
+            if boundary_delta is None:
+                hidden_in = boundary_base
+                normed = layer.input_layernorm(hidden_in)
+            else:
+                hidden_in, normed = fused_add_rmsnorm(
+                    boundary_base,
+                    boundary_delta,
+                    layer.input_layernorm.weight,
+                    layer.input_layernorm.eps,
+                    merged_boundary=True,
+                )
+            if getattr(layer, "is_linear", False):
+                residual = layer.linear_attn(normed, mask=mask, cache=layer_cache)
+            else:
+                residual = layer.self_attn(normed, mask=mask, cache=layer_cache)
+            boundary_base, mlp_input = fused_add_rmsnorm(
+                hidden_in,
+                residual,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.eps,
+                merged_boundary=False,
+            )
+            boundary_delta = layer.mlp(mlp_input)
+            return boundary_base + boundary_delta
+
+        hybrid_masks = hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")
+        if hybrid_masks:
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
-            for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache, strict=True)):
-                mask = ssm_mask if getattr(layer, "is_linear", False) else fa_mask
-                h = layer(h, mask=mask, cache=layer_cache)
-                if post_layer is not None:
-                    post_layer(h, layer_index)
-                capture_key = layer_index + 1
-                if capture_all:
-                    captured.append(h)
-                elif capture_layer_ids is not None and capture_key in capture_layer_ids:
-                    captured[capture_key] = h
         else:
-            mask = create_attention_mask(hidden_states, cache[0])
-            for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache, strict=True)):
-                h = layer(h, mask, layer_cache)
-                if post_layer is not None:
-                    post_layer(h, layer_index)
-                capture_key = layer_index + 1
-                if capture_all:
-                    captured.append(h)
-                elif capture_layer_ids is not None and capture_key in capture_layer_ids:
-                    captured[capture_key] = h
+            full_mask = create_attention_mask(hidden_states, cache[0])
+        for layer_index, (layer, layer_cache) in enumerate(
+            zip(inner.layers, cache, strict=True)
+        ):
+            mask = (
+                ssm_mask if getattr(layer, "is_linear", False) else fa_mask
+            ) if hybrid_masks else full_mask
+            h = advance_layer(layer, layer_cache, mask)
+            if post_layer is not None:
+                post_layer(h, layer_index)
+            capture_key = layer_index + 1
+            if capture_all:
+                captured.append(h)
+            elif capture_layer_ids is not None and capture_key in capture_layer_ids:
+                captured[capture_key] = h
         normalized = inner.norm(h)
         if logits_last_only and isinstance(captured, dict):
             captured[-1] = normalized
