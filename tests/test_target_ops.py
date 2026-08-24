@@ -421,6 +421,46 @@ def test_qwen_prefill_uses_original_attention(monkeypatch):
     assert attn.original_calls == 1
     assert out.shape == (1, 32, 1024)
 
+
+def test_qwen_verify_gqa_honors_configured_qk_max_length(monkeypatch):
+    attn, cache = _fake_qwen_full_attention()
+    attn._dflash_qk_max_length = 32
+    qwen_gdn._install_full_attention_gqa_hook(attn)
+    calls = []
+
+    def _fake_gqa(queries, keys, values, *, cache, scale, mask):
+        del keys, values, cache, scale, mask
+        calls.append(int(queries.shape[2]))
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(qwen_gdn, "_gqa_reshape_sdpa", _fake_gqa)
+
+    out = attn(mx.zeros((1, 20, 32), dtype=mx.bfloat16), mask="causal", cache=cache)
+    mx.eval(out)
+
+    assert calls == [20]
+    assert attn.original_calls == 0
+
+
+def test_qwen_verify_gqa_reports_configured_qk_length_fallback(monkeypatch):
+    attn, cache = _fake_qwen_full_attention()
+    fallback_calls = []
+    attn._dflash_qk_max_length = 16
+    attn._dflash_qk_fallback = lambda: fallback_calls.append(1)
+    qwen_gdn._install_full_attention_gqa_hook(attn)
+
+    def _fail_gqa(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("q_len > configured maximum entered verify GQA route")
+
+    monkeypatch.setattr(qwen_gdn, "_gqa_reshape_sdpa", _fail_gqa)
+
+    out = attn(mx.zeros((1, 20, 32), dtype=mx.bfloat16), mask="causal", cache=cache)
+    mx.eval(out)
+
+    assert fallback_calls == [1]
+    assert attn.original_calls == 1
+
 def test_qwen_quantized_kv_cache_uses_original_attention(monkeypatch):
     attn, _cache = _fake_qwen_full_attention()
     quantized_cache = QuantizedKVCache(group_size=64, bits=8)

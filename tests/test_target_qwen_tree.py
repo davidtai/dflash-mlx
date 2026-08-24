@@ -110,6 +110,23 @@ def _assert_close(lhs: mx.array, rhs: mx.array, *, atol: float = 1e-4) -> None:
     assert float(mx.max(mx.abs(lhs - rhs)).item()) <= atol
 
 
+def test_qwen_hidden_capture_calls_configured_post_layer_hook():
+    model = _tiny_qwen3_model()
+    ops = QwenGdnTargetOps()
+    calls = []
+    model.model._dflash_post_layer = lambda hidden, index: calls.append(
+        (tuple(hidden.shape), int(index))
+    )
+
+    logits, _captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=mx.array([[1, 2, 3]], dtype=mx.uint32),
+    )
+    mx.eval(logits)
+
+    assert calls == [((1, 3, 16), 0), ((1, 3, 16), 1)]
+
+
 def test_qwen_tree_verify_matches_sequential_path_logits():
     model = _tiny_qwen3_model()
     ops = QwenGdnTargetOps()

@@ -688,13 +688,20 @@ def _install_full_attention_gqa_hook(attn: Any) -> None:
         if tree_output is not None:
             return tree_output
         cached_prefix_len = int(getattr(cache, "offset", 0) or 0) if cache is not None else 0
-        can_route_gqa = (
+        qk_max_length = int(getattr(self, "_dflash_qk_max_length", 16))
+        cache_route_eligible = (
             cache is not None
             and not isinstance(cache, cache_mod.QuantizedKVCache)
             and cached_prefix_len >= _HYBRID_SDPA_EXACT_KV_THRESHOLD
             and (mask is None or mask == "causal" or isinstance(mask, mx.array))
-            and 0 < int(x.shape[1]) <= 16
         )
+        q_length = int(x.shape[1])
+        if cache_route_eligible and q_length > qk_max_length:
+            qk_fallback = getattr(self, "_dflash_qk_fallback", None)
+            if qk_fallback is not None:
+                qk_fallback()
+            return original_call(self, x, mask=mask, cache=cache)
+        can_route_gqa = cache_route_eligible and 0 < q_length <= qk_max_length
         if not can_route_gqa:
             return original_call(self, x, mask=mask, cache=cache)
         if not _attention_has_gated_q_proj(self):
@@ -881,6 +888,7 @@ class QwenGdnTargetOps:
             capture_layer_ids = set(capture_layer_ids)
             captured = {0: hidden_states} if 0 in capture_layer_ids else {}
         h = hidden_states
+        post_layer = getattr(inner, "_dflash_post_layer", None)
 
         if hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx"):
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
@@ -888,6 +896,8 @@ class QwenGdnTargetOps:
             for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache, strict=True)):
                 mask = ssm_mask if getattr(layer, "is_linear", False) else fa_mask
                 h = layer(h, mask=mask, cache=layer_cache)
+                if post_layer is not None:
+                    post_layer(h, layer_index)
                 capture_key = layer_index + 1
                 if capture_all:
                     captured.append(h)
@@ -897,6 +907,8 @@ class QwenGdnTargetOps:
             mask = create_attention_mask(hidden_states, cache[0])
             for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache, strict=True)):
                 h = layer(h, mask, layer_cache)
+                if post_layer is not None:
+                    post_layer(h, layer_index)
                 capture_key = layer_index + 1
                 if capture_all:
                     captured.append(h)
